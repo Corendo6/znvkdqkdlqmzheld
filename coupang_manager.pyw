@@ -31,7 +31,7 @@ import gross_margin
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.12"
+VERSION = "0.4.13"
 
 
 def resource_path(*parts):
@@ -3650,7 +3650,7 @@ class CoupangManager(tk.Tk):
         ttk.Combobox(api,textvariable=self.api_scope,state='readonly',width=39,
                      values=['전체 (재고 + 매출 + 상품·판매상태)','로켓그로스 재고만','로켓그로스 일일 매출만','상품정보·판매상태만']).grid(row=2,column=1,columnspan=3,sticky='w')
         yesterday=rocket_sales.today_kst()-timedelta(days=1)
-        self.api_sales_from=tk.StringVar(value=self.api_sales_from.get() if hasattr(self,'api_sales_from') else (yesterday-timedelta(days=6)).isoformat())
+        self.api_sales_from=tk.StringVar(value=self.api_sales_from.get() if hasattr(self,'api_sales_from') else (yesterday-timedelta(days=29)).isoformat())
         self.api_sales_to=tk.StringVar(value=self.api_sales_to.get() if hasattr(self,'api_sales_to') else yesterday.isoformat())
         ttk.Label(api,text='매출 결제일').grid(row=3,column=0,sticky='w',pady=5)
         period=ttk.Frame(api); period.grid(row=3,column=1,columnspan=3,sticky='w')
@@ -3663,6 +3663,7 @@ class CoupangManager(tk.Tk):
             self.api_sales_to.set(last.isoformat())
         ttk.Button(period,text='전일',command=lambda:set_period(1)).pack(side='left',padx=(8,4))
         ttk.Button(period,text='최근 7일',command=lambda:set_period(7)).pack(side='left')
+        ttk.Button(period,text='최근 30일',command=lambda:set_period(30)).pack(side='left',padx=(4,0))
         ttk.Label(period,text=' YYYY-MM-DD · 최대 30일',foreground='#666').pack(side='left')
         buttons=ttk.Frame(api); buttons.grid(row=4,column=0,columnspan=4,sticky='w',pady=(4,8))
         self.api_save_button=ttk.Button(buttons,text='API 설정 저장',command=self.save_api_settings)
@@ -3675,7 +3676,7 @@ class CoupangManager(tk.Tk):
         self.api_progress.grid(row=5,column=0,columnspan=4,sticky='ew',pady=5)
         ttk.Label(api,textvariable=self.api_status_var,foreground='#245',wraplength=880).grid(row=6,column=0,columnspan=4,sticky='w',pady=(5,8))
         ttk.Label(api,text='전체: 재고 → 일일 매출 → 상품정보·판매상태. 시작 시·주기적 자동 요청은 하지 않습니다.',foreground='#666').grid(row=7,column=0,columnspan=4,sticky='w')
-        ttk.Label(api,text='기본 기간은 최근 7일입니다. 재조회로 늦게 출고된 주문을 보충합니다. 하루만 원하면 전일을 누르세요.',foreground='#666').grid(row=8,column=0,columnspan=4,sticky='w',pady=(5,0))
+        ttk.Label(api,text='기본 기간은 어제까지 최근 30일입니다. 재고 화면의 어제·7일·30일 판매수량에 반영됩니다. 재조회로 늦게 출고된 주문을 보충합니다.',foreground='#666',wraplength=880).grid(row=8,column=0,columnspan=4,sticky='w',pady=(5,0))
         self._update_api_controls()
 
         info=ttk.LabelFrame(self.data_general,text='저장 위치',padding=14);info.pack(fill='x',pady=(0,12))
@@ -3954,6 +3955,8 @@ class CoupangManager(tk.Tk):
         elif kind == 'orders_saved':
             if getattr(self,'current_page','')=='sales':
                 self.refresh_sales()
+            elif getattr(self,'current_page','')=='rocket_inventory':
+                self.rocket_inventory_page.refresh()
         elif kind == 'sync_complete':
             _, results, cancelled = msg
             # Release busy state before any optional UI refresh can fail.
@@ -4789,6 +4792,10 @@ class CoupangManager(tk.Tk):
         if hasattr(self, 'rg_thumbnails'):
             self.rg_thumbnails.close()
         self.api_cancel_event.set()
+        # Let pages cancel their own Tk callbacks before root-level cleanup.
+        # Cancelling child callbacks via the root leaves stale Tcl command names.
+        for child in list(self.winfo_children()):
+            child.destroy()
         for job in self.tk.call('after', 'info'):
             try: self.after_cancel(job)
             except tk.TclError: pass

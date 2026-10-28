@@ -30,6 +30,55 @@ def ensure_schema(conn):
         quantity INTEGER NOT NULL, revenue TEXT NOT NULL, fetched_at TEXT NOT NULL,
         PRIMARY KEY(vendor_id,order_id,option_id))''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_rg_orders_date ON rg_order_items(vendor_id,paid_date,option_id)')
+    had_coverage = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rg_sales_coverage'").fetchone()
+    conn.execute('''CREATE TABLE IF NOT EXISTS rg_sales_coverage(
+        vendor_id TEXT NOT NULL, sale_date TEXT NOT NULL, fetched_at TEXT NOT NULL,
+        PRIMARY KEY(vendor_id,sale_date))''')
+    if not had_coverage:
+        # Older versions retained only the most recent successful query range.
+        # Do not infer coverage from dates containing orders: empty days matter.
+        settings = dict(conn.execute('SELECT key,value FROM settings'))
+        prefix = 'rg_orders_last_sync:'
+        for key, stamp in settings.items():
+            if not key.startswith(prefix) or not stamp:
+                continue
+            vendor = key[len(prefix):]
+            try:
+                datetime.fromisoformat(stamp)
+                first = date.fromisoformat(settings.get('rg_orders_last_from:' + vendor, ''))
+                last = date.fromisoformat(settings.get('rg_orders_last_to:' + vendor, ''))
+            except (ValueError, TypeError):
+                continue
+            if vendor and 0 <= (last - first).days < 30:
+                _save_coverage(conn, vendor, first, last, stamp)
+
+
+def _save_coverage(conn, vendor, first, last, stamp):
+    conn.executemany('''INSERT INTO rg_sales_coverage(vendor_id,sale_date,fetched_at)
+        VALUES (?,?,?) ON CONFLICT(vendor_id,sale_date) DO UPDATE SET fetched_at=excluded.fetched_at''',
+        [(vendor, (first + timedelta(days=i)).isoformat(), stamp)
+         for i in range((last - first).days + 1)])
+
+
+def daily_quantities(conn, vendor, today=None):
+    """API-only quantities by option, through yesterday KST; incomplete windows are unknown."""
+    today = today or today_kst()
+    last = (today - timedelta(days=1)).isoformat()
+    starts = {n: (today - timedelta(days=n)).isoformat() for n in (1, 7, 30)}
+    covered = [r[0] for r in conn.execute('''SELECT sale_date FROM rg_sales_coverage
+        WHERE vendor_id=? AND sale_date BETWEEN ? AND ?''', (vendor, starts[30], last))]
+    coverage = {n: sum(day >= start for day in covered) for n, start in starts.items()}
+    metrics = {'yesterday': 1, 'last7': 7, 'sales_30': 30}
+    empty = {key: 0 if coverage[n] == n else None for key, n in metrics.items()}
+    by_option = {}
+    for oid, day, quantity in conn.execute('''SELECT option_id,paid_date,SUM(quantity)
+        FROM rg_order_items WHERE vendor_id=? AND paid_date BETWEEN ? AND ?
+        GROUP BY option_id,paid_date''', (vendor, starts[30], last)):
+        totals = by_option.setdefault(oid, dict(empty))
+        for key, n in metrics.items():
+            if totals[key] is not None and day >= starts[n]:
+                totals[key] += quantity
+    return dict(by_option=by_option, coverage=coverage, empty=empty)
 
 
 def _id(value, name):
@@ -214,7 +263,7 @@ def rebuild_sales(conn, vendor, start=None, end=None, option_ids=None):
 
 def save_orders(conn, vendor, orders, start, end):
     """Commit only after every page succeeds. Repeated queries replace the same orders."""
-    validate_period(start, end)
+    first, last = validate_period(start, end)
     stamp = datetime.now(KST).isoformat(timespec='seconds')
     affected = [start, end]
     with conn:
@@ -231,6 +280,7 @@ def save_orders(conn, vendor, orders, start, end):
                               item['quantity'], str(item['revenue']), stamp))
         # Missing orders are not interpreted as cancellations: that status is not provided.
         result = rebuild_sales(conn, vendor, min(affected), max(affected))
+        _save_coverage(conn, vendor, first, last, stamp)
         result['orders'] = len(orders)
         for key, value in [('last_sync', stamp), ('last_from', start), ('last_to', end), ('last_error', '')]:
             conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)', ('rg_orders_' + key + ':' + vendor, value))

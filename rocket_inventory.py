@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """Rocket Growth inventory, replenishment estimates, and WING-like desktop page.
 
-Only the dedicated RG API supplies orderable stock / trailing 30-day sales.
+The inventory API supplies stock; daily order API quantities supply all sales windows.
 Missing observations remain unknown; inbound quantities are explicitly manual.
 """
 import csv
 import gross_margin
+import rocket_sales
 import hashlib
 import io
 import math
@@ -193,17 +194,16 @@ def estimated_costs(app, products):
 
 def build_rows(app, now=None):
     now = now or now_kst()
+    now = now.replace(tzinfo=KST) if now.tzinfo is None else now.astimezone(KST)
     vendor = app.db.setting('api_vendor_id', '').strip()
     lead = whole_number(app.db.setting('rg_lead_days', '5'), nullable=False)
     target = whole_number(app.db.setting('rg_target_days', '14'), nullable=False)
     safety = whole_number(app.db.setting('rg_safety_days', '3'), nullable=False)
     pending = {r['option_id']: dict(r) for r in app.db.query('SELECT * FROM rg_replenishment WHERE vendor_id=?', (vendor,))}
     # Catalog enrollment alone is not evidence that an option is in RG inventory.
-    # Keep recent sold-out options; hide confirmed 0 stock / 0 sales / no inbound.
+    # Zero-stock filtering follows daily-sales aggregation below.
     snapshots = {r['option_id']: dict(r) for r in app.db.query(
-        'SELECT * FROM rg_inventory_snapshots WHERE vendor_id=? AND in_latest_response=1', (vendor,))
-        if not (r['orderable_quantity'] == 0 and r['sales_30'] == 0
-                and not pending.get(r['option_id'], {}).get('pending_quantity'))}
+        'SELECT * FROM rg_inventory_snapshots WHERE vendor_id=? AND in_latest_response=1', (vendor,))}
     products = {}
     for row in app.db.query("SELECT * FROM products WHERE fulfillment_type='로켓그로스' ORDER BY updated_at DESC,id DESC"):
         p = dict(row)
@@ -213,13 +213,7 @@ def build_rows(app, now=None):
     for oid, snapshot in snapshots.items():
         if oid not in products:
             products[oid] = dict(option_id=oid, product_name='상품정보 연결 필요', model='', id=None)
-    yesterday = now.date() - timedelta(days=1)
-    week_start = now.date() - timedelta(days=7)
-    stored = {}
-    for row in app.db.query('''SELECT option_id,sale_date,SUM(quantity) quantity FROM sales
-            WHERE method='로켓그로스' AND COALESCE(option_id,'')<>'' AND sale_date BETWEEN ? AND ?
-            GROUP BY option_id,sale_date''', (week_start.isoformat(), yesterday.isoformat())):
-        stored.setdefault(str(row['option_id']), {})[row['sale_date']] = row['quantity']
+    daily = rocket_sales.daily_quantities(app.db.conn, vendor, now.date())
     context = gross_margin.load_context(app.db)
     rows = []
     for key, p in products.items():
@@ -227,20 +221,22 @@ def build_rows(app, now=None):
         p = dict(p, model=gross['model'])
         oid = str(p.get('option_id') or '').strip()
         snap, manual = snapshots.get(oid, {}), pending.get(oid, {})
-        stock, sales = snap.get('orderable_quantity'), snap.get('sales_30')
+        history = daily['by_option'].get(oid, daily['empty'])
+        stock, sales = snap.get('orderable_quantity'), history['sales_30']
+        if stock == 0 and sales == 0 and not manual.get('pending_quantity'):
+            continue
         state, days, usable = inventory_state(stock, sales, snap.get('fetched_at'),
                                               bool(snap.get('in_latest_response')), lead, safety, now)
         quantity = manual.get('pending_quantity')
         pack = manual.get('pack_quantity', 1)
         recommended = replenishment(stock, sales, quantity, lead, target, safety, pack) if usable else None
-        history = stored.get(oid, {})
         rows.append(dict(p, key=key, vendor_id=vendor, stock=stock, sales_30=sales,
                          pending=quantity, pack=pack, pending_note=manual.get('note', ''),
                          pending_updated=manual.get('updated_at'), recommended=recommended,
                          state=state, days=days, usable=usable, checked_at=snap.get('fetched_at'),
                          external_sku_id=snap.get('external_sku_id', ''),
-                         yesterday=history.get(yesterday.isoformat()),
-                         last7=sum(history.values()) if history else None, recorded_days=len(history),
+                         yesterday=history['yesterday'], last7=history['last7'],
+                         recorded_days=daily['coverage'][7], sales_recorded_days=daily['coverage'][30],
                          gross=gross, estimated_cost=gross['estimated_cost'],
                          unit_cost=gross['cost'], logistics=gross['logistics'],
                          margin=gross['margin'], margin_rate=gross['margin_rate'],
@@ -539,6 +535,11 @@ class RocketInventoryPage(tk.Frame):
         status = '마지막 재고 조회: ' + (stamp.replace('T', ' ')[:19] + ' (한국시간)' if stamp else '아직 조회하지 않았습니다')
         if error:
             status += '  ·  최근 조회 실패 — 이전 결과 표시 중'
+        sales_stamp = self.app.db.setting('rg_orders_last_sync:' + vendor, '')
+        sales_error = self.app.db.setting('rg_orders_last_error:' + vendor, '')
+        status += '\n마지막 일일 매출 조회: ' + (sales_stamp.replace('T', ' ')[:19] + ' (한국시간)' if sales_stamp else '조회 전 · 데이터·설정에서 최근 30일 조회')
+        if sales_error:
+            status += '  ·  최근 매출 조회 실패 — 이전 결과 표시 중'
         self.set_status(status)
         total = len(self.rows)
         good = sum(r['state'] == '양호' for r in self.rows)
@@ -722,7 +723,7 @@ class RocketInventoryPage(tk.Frame):
         metric(2, 20, '어제', format_number(r['yesterday']))
         metric(2, 48, '7일', format_number(r['last7']))
         metric(2, 76, '30일', format_number(r['sales_30']), True)
-        self._text(c, edges[2]+10, y+107, f'7일 중 {r["recorded_days"]}일 기록', color=MUTED, size=8)
+        self._text(c, edges[2]+10, y+107, f'일일매출 {r["sales_recorded_days"]}/30일 조회', color=MUTED, size=8)
         metric(3, 20, '판매가능', format_number(r['stock']), True)
         text = '소진 예상 —' if r['days'] is None else f'소진 예상 {r["days"]:.1f}일'
         self._text(c, edges[3]+10, y+45, text, color=ORANGE if r['state'] in ('품절 임박', '품절') else MUTED, size=8)
@@ -1000,9 +1001,13 @@ class RocketInventoryPage(tk.Frame):
             '  상품 등록정보의 로켓그로스 분류만으로 추가하지 않습니다.\n'
             '  재고·최근 30일 판매가 모두 0이고 입력된 입고중 물량도 없으면 제외합니다.\n'
             '  최근 판매가 있는 품절 상품과 미확인 수량은 그대로 표시합니다.\n'
-            '• 판매가능 / 지난 30일: 로켓그로스 재고 API 응답입니다.\n'
-            '• 어제 / 지난 7일: 한국시간 기준, 옵션 ID가 연결된 저장 매출만 합산합니다.\n'
-            '  기록이 없는 날은 0으로 추정하지 않으며, 기록된 일수를 함께 표시합니다.\n'
+            '• 판매가능: 로켓그로스 재고 API 응답입니다.\n'
+            '• 어제 / 7일 / 30일: 일일 매출 API로 수집한 옵션별 판매수량을 합산합니다.\n'
+            '  모두 한국시간 어제까지이며, 주문 건수나 매출액이 아닌 판매 개수입니다.\n'
+            '  기간 전체를 조회했으면 판매 없는 날은 0개, 미조회 날짜가 있으면 —입니다.\n'
+            '  데이터·설정 > API 갱신에서 최근 30일 매출을 조회하세요.\n'
+            '  출고된 주문의 결제일 기준 잠정 수량입니다. 재조회 시 늦은 출고분을 보충합니다.\n'
+            '  직접 입력·Excel 매출은 포함하지 않아 일일 매출 탭의 수정값과 다를 수 있습니다.\n'
             '• 입고중: 직접 입력합니다. 입고가 끝나면 남은 수량으로 수정하세요.\n'
             '• 입고권장 / 소진 예상 / 상품 상태: 최근 30일 판매속도로 자체 계산합니다.\n'
             '• 판매가: 상품 관리에 저장된 값입니다. 쿠폰·지도가 등은 마진 상세에서 확인합니다.\n'
@@ -1028,8 +1033,9 @@ class RocketInventoryPage(tk.Frame):
             return
         columns = [('model', '모델명'), ('product_name', '상품명'), ('option_name', '옵션명'), ('option_id', '옵션ID'),
                    ('stock', '주문가능재고'), ('pending', '입고중_직접입력'), ('recommended', '권장추가입고_자체계산'),
-                   ('pack', '입고단위'), ('sales_30', '최근30일판매량_API'), ('yesterday', '어제판매량_저장자료'),
-                   ('last7', '7일판매량_저장자료'), ('recorded_days', '7일중기록일수'), ('days', '소진예상일수'),
+                   ('pack', '입고단위'), ('sales_30', '30일판매수량_일일매출API'), ('yesterday', '어제판매수량_일일매출API'),
+                   ('last7', '7일판매수량_일일매출API'), ('recorded_days', '7일중조회완료일수'),
+                   ('sales_recorded_days', '30일중조회완료일수'), ('days', '소진예상일수'),
                    ('sale_price', '판매가_저장값'), ('coupon_price', '쿠폰가_저장값'), ('estimated_cost', '예상개당비용_자체계산'),
                    ('unit_cost', '원가'), ('logistics', '물류비_VAT포함'),
                    ('margin', '개당예상마진'), ('margin_rate', '예상마진율_퍼센트'), ('margin_missing', '마진미확인사유'),
