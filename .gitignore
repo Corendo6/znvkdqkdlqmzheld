@@ -1,0 +1,21 @@
+# Local data and credentials
+userdata/
+data/
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite*
+*credentials*.json
+*secrets*.json
+# Runtime and build output
+__pycache__/
+*.py[cod]
+logs/
+debug/
+*.log
+build/
+dist/
+*.spec
+.venv/
+venv/

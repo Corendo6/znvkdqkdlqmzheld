@@ -1,0 +1,30 @@
+쿠팡 관리 프로그램 v0.2.0 - Open API 설정
+
+1) 쿠팡 WING에서 Open API 키를 발급합니다.
+   필요한 값: Vendor ID(업체코드), Access Key, Secret Key
+
+2) WING의 Open API 설정에서 API 호출을 허용할 IP를 등록합니다.
+   현재 PC/네트워크의 공인 IP가 바뀌면 API 호출이 거절될 수 있습니다.
+
+3) 프로그램 실행 -> 데이터 · 설정 -> 쿠팡 Open API
+   Vendor ID / Access Key / Secret Key 입력 -> API 설정 저장
+
+4) "연결 테스트"를 누릅니다.
+   성공하면 "상품목록 지금 동기화"를 누릅니다.
+
+5) 자동 동기화를 원하면 "자동 동기화(분)"에 숫자를 입력합니다.
+   예) 60 = 프로그램 실행 중 60분마다 동기화
+   0 = 자동 동기화 끔
+
+동기화되는 주요 항목
+- 등록상품 ID(sellerProductId)
+- 노출상품 ID(productId)
+- 옵션 ID(vendorItemId)
+- 옵션명(itemName)
+- 판매가(salePrice)
+- 모델번호(modelNo) / 판매자 SKU(externalVendorSku)
+- 등록상품명 / 노출상품명 / 상품 상태
+
+주의
+- Secret Key는 채팅에 보내지 마세요.
+- 로켓그로스 여부는 일반 상품 상세 API만으로 확정하지 않고, 기존 프로그램에서 로켓그로스로 지정한 상태는 동기화 시 보존합니다.
