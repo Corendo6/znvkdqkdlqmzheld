@@ -159,9 +159,9 @@ class SalesTestCase(unittest.TestCase):
         self.raw(1, 2)
         before = self.totals()
         replies = iter([{'code': 200, 'data': [], 'nextToken': 'page-two'},
-                        {'code': 500, 'message': 'failed'}])
+                        *[{'code': 500, 'message': 'failed'}] * 3])
         api = SimpleNamespace(vendor_id=VENDOR, check_cancelled=lambda: None,
-                              _request=lambda *args: next(replies))
+                              _request=lambda *args: next(replies), wait=lambda seconds: None)
         with self.assertRaises(ValueError):
             orders = rocket_sales.fetch_orders(api, self.day(30), self.day(1))
             rocket_sales.save_orders(self.conn, VENDOR, orders, self.day(30), self.day(1))

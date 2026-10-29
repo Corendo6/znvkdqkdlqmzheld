@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 KST = timezone(timedelta(hours=9))
 SOURCE_PREFIX = 'rg-order-api:'
 ORDER_PATH = '/v2/providers/rg_open_api/apis/api/v1/vendors/{vendorId}/rg/orders'
+ORDER_DETAIL_PATH = '/v2/providers/rg_open_api/apis/api/v1/vendors/{vendorId}/rg/order/{orderId}'
 
 
 def today_kst():
@@ -133,15 +134,68 @@ def normalize_order(order, vendor, first, last):
     return dict(order_id=order_id, paid_date=paid, items=grouped)
 
 
+def _request_sales(api, path, params=None, progress=None):
+    """RG sometimes reports rate limiting as HTTP 200 with code 500 in JSON."""
+    for attempt in range(3):
+        api.check_cancelled()
+        response = api._request('GET', path, params)
+        if not isinstance(response, dict):
+            return response
+        code = str(response.get('code', '')).upper()
+        message = str(response.get('message') or '').lower()
+        transient = code in ('429', '500', '502', '503', '504')
+        if not transient or attempt == 2:
+            return response
+        delay = 30 * (attempt + 1)
+        callback = progress or getattr(api, 'progress', None)
+        if callback:
+            reason = '쿠팡 호출 제한' if code == '429' or '429' in message or 'too many requests' in message else '쿠팡 일시 오류'
+            callback(f'{reason} · {delay}초 후 재시도 {attempt+1}/2')
+        api.wait(delay)
+    return response
+
+
+def fetch_order_detail(api, order_id, first, last, progress=None):
+    """Resolve repeated list entries against the complete order, not guessed sums."""
+    api.check_cancelled()
+    response = _request_sales(api, ORDER_DETAIL_PATH.format(vendorId=api.vendor_id, orderId=order_id), progress=progress)
+    if not isinstance(response, dict) or str(response.get('code')).upper() not in ('200', 'SUCCESS'):
+        reason = f"{response.get('code', '')} {response.get('message', '')}".strip() if isinstance(response, dict) else '응답 형식 오류'
+        raise ValueError('중복 주문의 상세 조회에 실패했습니다: ' + reason + '\n이전 매출을 유지합니다.')
+    raw = response.get('data')
+    if isinstance(raw, list) and len(raw) == 1:
+        raw = raw[0]
+    if not isinstance(raw, dict) or str(raw.get('orderId')) != order_id:
+        raise ValueError('주문 상세 응답의 주문번호를 확인할 수 없습니다. 이전 매출을 유지합니다.')
+    raw = dict(raw)
+    paid = raw.get('paidAt')
+    # Live API uses milliseconds/unitSalesPrice; the documented detail format
+    # also allows an ISO payment datetime and salesPrice.
+    if isinstance(paid, str) and 'T' in paid:
+        try:
+            stamp = datetime.fromisoformat(paid.replace('Z', '+00:00'))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=KST)
+            raw['paidAt'] = int(stamp.timestamp() * 1000)
+        except (ValueError, OverflowError, OSError):
+            raise ValueError('주문 상세의 결제일시를 읽을 수 없습니다.') from None
+    if isinstance(raw.get('orderItems'), list):
+        raw['orderItems'] = [dict(item, unitSalesPrice=item.get('unitSalesPrice', item.get('salesPrice')))
+                             if isinstance(item, dict) else item for item in raw['orderItems']]
+    order = normalize_order(raw, api.vendor_id, first, last)
+    api.check_cancelled()
+    return order
+
+
 def fetch_orders(api, start, end, progress=None):
     first, last = validate_period(start, end)
     params = {'paidDateFrom': first.strftime('%Y%m%d'), 'paidDateTo': last.strftime('%Y%m%d')}
     path = ORDER_PATH.format(vendorId=api.vendor_id)
-    orders, seen_tokens = {}, set()
+    orders, seen_tokens, repeated_orders = {}, set(), set()
     for page in range(1, 10001):
         api.check_cancelled()
         api.phase = f'로켓그로스 일일 매출 {page}페이지'
-        response = api._request('GET', path, params)
+        response = _request_sales(api, path, params, progress)
         if not isinstance(response, dict) or str(response.get('code')).upper() not in ('200', 'SUCCESS'):
             raise ValueError('주문 조회 실패: ' + str(response.get('message', '') if isinstance(response, dict) else '응답 형식 오류'))
         if not isinstance(response.get('data'), list):
@@ -149,14 +203,28 @@ def fetch_orders(api, start, end, progress=None):
         for raw in response['data']:
             order = normalize_order(raw, api.vendor_id, first.isoformat(), last.isoformat())
             old = orders.get(order['order_id'])
-            if old is not None and old != order:
-                raise ValueError('페이지 사이에서 같은 주문 내용이 달라졌습니다. 다시 조회하세요.')
-            orders[order['order_id']] = order
+            if old is None:
+                orders[order['order_id']] = order
+            else:
+                # Disjoint options can be merged directly. Overlapping options
+                # may be duplicate snapshots OR separate shipment lines, so only
+                # the complete order can resolve their quantities reliably.
+                if old['paid_date'] != order['paid_date'] or set(old['items']) & set(order['items']):
+                    repeated_orders.add(order['order_id'])
+                old['items'].update(order['items'])
         if progress:
             progress(f'로켓그로스 일일 매출 {page}페이지 · {len(orders):,}개 주문 수신')
         token = response.get('nextToken')
         if token in (None, ''):
             api.check_cancelled()
+            for index, oid in enumerate(sorted(repeated_orders), 1):
+                api.phase = f'나뉜 주문 상세 확인 {index}/{len(repeated_orders)}'
+                if progress:
+                    progress(api.phase)
+                complete = fetch_order_detail(api, oid, first.isoformat(), last.isoformat(), progress)
+                if not set(orders[oid]['items']).issubset(complete['items']):
+                    raise ValueError('주문 상세에서 목록의 일부 옵션을 확인하지 못했습니다. 다시 조회하세요.')
+                orders[oid] = complete
             return list(orders.values())
         token = str(token)
         if token in seen_tokens:
@@ -173,7 +241,9 @@ def prefer_external_sale(conn, paid_date, model, method, option_id=''):
     if option_id:
         where, args = 'option_id=?', [str(option_id)]
     else:
-        where, args = "(model=? OR COALESCE(model,'')='')", [model]
+        if not str(model or '').strip():
+            return
+        where, args = 'model=?', [model]
     conn.execute(f"DELETE FROM sales WHERE sale_date=? AND method='로켓그로스' AND source LIKE ? AND {where}",
                  [paid_date, SOURCE_PREFIX + '%', *args])
 
@@ -223,7 +293,7 @@ def rebuild_sales(conn, vendor, start=None, end=None, option_ids=None):
         group = grouped.get(key)
         product = products.get(oid, {})
         model = str(mappings.get(oid) or product.get('model') or '').strip()
-        conflict = key in pending or any(other_oid == oid or (not other_oid and (not model or other_model == model))
+        conflict = key in pending or any(other_oid == oid or (not other_oid and model and other_model == model)
                                         for other_oid, other_model in external.get(paid, []))
         if group is None or conflict:
             if rows:
@@ -290,7 +360,8 @@ def save_orders(conn, vendor, orders, start, end):
 
 
 def summary(result):
-    return (f"매출 추가 {result['inserted']} / 갱신 {result['updated']} / 동일 {result['unchanged']}"
+    prefix = f"주문 {result['orders']:,}건 수집 · " if 'orders' in result else ''
+    return (prefix + f"일별 옵션 매출 추가 {result['inserted']} / 갱신 {result['updated']} / 동일 {result['unchanged']}"
             f" · 기존 기록 우선 {result['conflicts']} · 모델 미연결 {result['unmapped']}")
 
 

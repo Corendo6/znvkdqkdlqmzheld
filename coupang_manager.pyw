@@ -31,7 +31,7 @@ import gross_margin
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.13"
+VERSION = "0.4.14"
 
 
 def resource_path(*parts):
@@ -249,7 +249,7 @@ class CoupangAPI:
         last_error = None
         for attempt in range(2):
             self.check_cancelled()
-            if '/rg/inventory/' in path or path.endswith('/rg/orders'):
+            if '/rg/inventory/' in path or path.endswith('/rg/orders') or '/rg/order/' in path:
                 # Include retry attempts and subsequent refreshes in the 50/min limit.
                 with CoupangAPI._rg_rate_lock:
                     self.wait(max(0, CoupangAPI._rg_next_at - time.monotonic()))
@@ -3268,7 +3268,13 @@ class CoupangManager(tk.Tk):
 
     # ---------------- Sales ----------------
     def build_sales(self):
-        self.page_header("일일 매출", "API 갱신은 데이터 · 설정에서 실행합니다. 로켓그로스 주문은 결제일(한국시간)·옵션별로 기록합니다.")
+        self.page_header("일일 매출", "로켓그로스 주문을 조회해 결제일(한국시간)·옵션별 판매수량과 매출을 저장합니다.")
+        sync_bar=ttk.Frame(self.content); sync_bar.pack(fill='x',pady=(0,8))
+        self.sales_api_sync_button=ttk.Button(sync_bar,text='최근 30일 API 조회·저장',style='Accent.TButton',command=self.sync_recent_daily_sales)
+        self.sales_api_sync_button.pack(side='left')
+        self.sales_api_cancel_button=ttk.Button(sync_bar,text='조회 취소',command=self.api_cancel_sync)
+        self.sales_api_cancel_button.pack(side='left',padx=6)
+        ttk.Label(sync_bar,text='어제까지 조회 · 재조회해도 중복 합산하지 않습니다.',foreground='#666').pack(side='left',padx=6)
         ttk.Label(self.content,text='주문 API: 출고분·잠정 금액(판매수량 × 단가) · 취소/반품 차감 순매출과 다를 수 있습니다.',foreground='#795200').pack(anchor='w',pady=(0,4))
         self.sales_api_status=ttk.Label(self.content,text='',foreground='#666',wraplength=1100)
         self.sales_api_status.pack(anchor='w',pady=(0,8))
@@ -3293,6 +3299,13 @@ class CoupangManager(tk.Tk):
         cols=[('id','ID'),('date','날짜'),('model','모델명'),('oid','옵션 ID'),('option','옵션명'),('method','판매방식'),('revenue','매출(원)'),('orders','주문'),('qty','판매량'),('source','자료 출처')]
         self.sales_tree=self.make_tree(self.content,cols,{'id':55,'date':105,'model':120,'oid':125,'option':230,'method':105,'revenue':120,'orders':65,'qty':65,'source':180})
         e.bind('<Return>',lambda x:self.refresh_sales()); self.refresh_sales()
+        self._update_api_controls()
+
+    def sync_recent_daily_sales(self):
+        today=rocket_sales.today_kst()
+        self.api_sync_all(scope='로켓그로스 일일 매출만',
+                          sales_from=(today-timedelta(days=30)).isoformat(),
+                          sales_to=(today-timedelta(days=1)).isoformat())
 
     def add_sale(self):
         v=self.sale_vars
@@ -3323,12 +3336,14 @@ class CoupangManager(tk.Tk):
         for r in rows:
             self.sales_tree.insert('', 'end',iid=str(r['id']),values=(r['id'],r['sale_date'],r['model'] or '모델 연결 필요',r['option_id'] or '',r['option_name'] or '',r['method'],money(r['revenue']),money(r['orders']),money(r['quantity']),rocket_sales.source_label(r['source'])))
         stamp=self.db.setting('rg_orders_last_sync:'+vendor,'')
-        status=('마지막 주문 조회: '+stamp[:19].replace('T',' ')+' (한국시간) · '+self.db.setting('rg_orders_last_result:'+vendor,'')) if stamp else '주문 API 조회 전 · 데이터 · 설정에서 로켓그로스 일일 매출을 갱신하세요.'
+        status=('마지막 주문 조회: '+stamp[:19].replace('T',' ')+' (한국시간) · '+self.db.setting('rg_orders_last_result:'+vendor,'')) if stamp else '주문 API 조회 전 · 위의 최근 30일 API 조회·저장 버튼을 누르세요.'
         missing=self.db.one("SELECT COUNT(*) n FROM sales WHERE source=? AND COALESCE(model,'')=''",(api_source,))['n']
         if missing:
             status+=f' · 모델 미연결 {missing}건은 함께 표시합니다. 마스터 데이터 > 모델·옵션 매핑에서 연결하세요.'
         error=self.db.setting('rg_orders_last_error:'+vendor,'')
         if error: status+=' · 최근 조회 실패: '+error[:150]
+        if len(rows)==2500:
+            status+=' · 화면은 최신 2,500건까지 표시합니다. 전체 저장 자료는 CSV 내보내기로 확인하세요.'
         self.sales_api_status.configure(text=status)
 
     def delete_sale(self):
@@ -3796,10 +3811,14 @@ class CoupangManager(tk.Tk):
         page = getattr(self, 'rocket_inventory_page', None)
         if getattr(self, 'current_page', '') == 'rocket_inventory' and page and page.winfo_exists():
             page.set_status(text[:280])
+        status = getattr(self, 'sales_api_status', None)
+        if getattr(self, 'current_page', '') == 'sales' and status and status.winfo_exists():
+            status.configure(text=text[:500])
 
     def _update_api_controls(self):
         controls = [('api_sync_button', not self.api_busy), ('api_cancel_button', self.api_busy),
-                    ('api_save_button', not self.api_busy)]
+                    ('api_save_button', not self.api_busy), ('sales_api_sync_button', not self.api_busy),
+                    ('sales_api_cancel_button', self.api_busy)]
         for name, enabled in controls:
             widget = getattr(self, name, None)
             if widget is not None and widget.winfo_exists():
@@ -3816,7 +3835,7 @@ class CoupangManager(tk.Tk):
             self.api_cancel_event.set()
             self._set_api_status('취소 요청됨 · 진행 중인 네트워크 요청이 끝나면 중단합니다')
 
-    def api_sync_all(self):
+    def api_sync_all(self, scope=None, sales_from=None, sales_to=None):
         """The only UI entry point for API requests; one worker owns the whole run."""
         if self.api_busy:
             return
@@ -3824,7 +3843,7 @@ class CoupangManager(tk.Tk):
             messagebox.showwarning(APP_NAME, '데이터 · 설정에서 Vendor ID와 API 키를 확인하세요.')
             return
         vendor, access, secret = self._credentials_from_db()
-        scope = self.api_scope.get()
+        scope = scope or self.api_scope.get()
         all_scopes=scope.startswith('전체 ')
         do_inventory=all_scopes or scope=='로켓그로스 재고만'
         do_orders=all_scopes or scope=='로켓그로스 일일 매출만'
@@ -3832,8 +3851,8 @@ class CoupangManager(tk.Tk):
         if not any((do_inventory,do_orders,do_products)):
             messagebox.showwarning(APP_NAME,'갱신 범위를 선택하세요.')
             return
-        sales_from=self.api_sales_from.get().strip()
-        sales_to=self.api_sales_to.get().strip()
+        sales_from=sales_from if sales_from is not None else self.api_sales_from.get().strip()
+        sales_to=sales_to if sales_to is not None else self.api_sales_to.get().strip()
         if do_orders:
             try: rocket_sales.validate_period(sales_from,sales_to)
             except ValueError as exc:
