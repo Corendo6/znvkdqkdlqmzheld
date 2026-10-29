@@ -1047,7 +1047,7 @@ class CoupangManager(tk.Tk):
         self.api_last_status = 'API 갱신을 실행하면 진행 상황이 여기에 표시됩니다.'
         self.api_status_var = tk.StringVar(value=self.api_last_status)
         self.title(f"{APP_NAME}  v{VERSION}")
-        self.geometry("1500x900")
+        self.geometry("1600x900")
         self.minsize(1180, 720)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._style()
