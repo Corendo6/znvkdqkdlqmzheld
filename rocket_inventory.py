@@ -28,6 +28,11 @@ KST = timezone(timedelta(hours=9))
 INVENTORY_PATH = '/v2/providers/rg_open_api/apis/api/v1/vendors/{vendorId}/rg/inventory/summaries'
 BG, INK, MUTED, BLUE = '#ffffff', '#172b4d', '#8293a8', '#346bdb'
 BORDER, PALE, ORANGE, GREEN = '#dce2e9', '#eef8fa', '#e87d15', '#20964f'
+RED = '#c62828'
+
+
+def urgent_stock(row):
+    return row.get('state') in ('품절', '품절 임박')
 
 
 def now_kst():
@@ -424,6 +429,11 @@ class RocketInventoryPage(tk.Frame):
         self.label(title, '로켓그로스 재고 · 마진', size=21, bold=True).pack(side='left')
         self.label(title, 'API 갱신: 데이터 · 설정', color=MUTED, size=9).pack(side='right', padx=10)
         self.button(title, '입고 기준 설정', self.settings_dialog).pack(side='right', padx=8)
+        app_mode = self.app.db.setting('rg_view_mode', '기본 보기')
+        self.view_mode = tk.StringVar(value=app_mode if app_mode in ('기본 보기','엑셀형 보기') else '기본 보기')
+        view = ttk.Combobox(title, textvariable=self.view_mode, values=['기본 보기','엑셀형 보기'], state='readonly', width=12)
+        view.pack(side='right', padx=8)
+        view.bind('<<ComboboxSelected>>', self.change_view)
         self.status_label = self.label(self, '재고 API 조회 전', color=MUTED, anchor='w')
         self.status_label.pack(fill='x', pady=(0, 14))
         summary = tk.Frame(self, bg='#f6f9fc', padx=14, pady=11)
@@ -449,6 +459,7 @@ class RocketInventoryPage(tk.Frame):
         self.button(toolbar, '선택 입고중 입력', self.edit_selected).pack(side='right', padx=8)
         self.label(self, '최근 재고 응답 상품  ·  현재 판매가 기준 마진 · 클릭: 비용 상세  ·  F5: 모델명 / 상품명 / 옵션 ID 검색', color=MUTED, size=9, anchor='w').pack(fill='x', pady=(0, 6))
         holder = tk.Frame(self, bg=BG, highlightthickness=1, highlightbackground=BORDER)
+        self.holder = holder
         holder.grid_columnconfigure(0, weight=1)
         holder.grid_rowconfigure(1, weight=1)
         self.header = tk.Canvas(holder, bg='#f8fafc', height=44, highlightthickness=0)
@@ -489,6 +500,73 @@ class RocketInventoryPage(tk.Frame):
         self.label(self, '현재 판매가 기준 예상 마진 = 판매가 − 수수료(VAT) − 원가 − 물류비(VAT)  ·  보관·반품비 제외  ·  미확인 값은 —',
                    color=MUTED, size=9, anchor='w').pack(side='bottom', fill='x', pady=(6, 0))
         holder.pack(fill='both', expand=True)
+        self.sheet_frame = ttk.Frame(holder)
+        self.sheet_columns = [('model','모델',120),('product_name','상품명',260),('option_name','옵션',170),
+            ('option_id','옵션 ID',120),('yesterday','어제 판매',85),('last7','7일 판매',85),
+            ('sales_30','30일 판매',85),('stock','판매가능',85),('pending','입고중',85),
+            ('recommended','권장입고',85),('days','소진 예상(일)',100),('state','재고 상태',110),
+            ('sale_price','판매가',100),('unit_cost','원가',90),('margin','개당 마진',100),('margin_rate','마진율(%)',95)]
+        self.sheet = ttk.Treeview(self.sheet_frame, columns=[k for k,_,_ in self.sheet_columns], show='headings', selectmode='extended')
+        for key,label,width in self.sheet_columns:
+            self.sheet.heading(key,text=label)
+            self.sheet.column(key,width=width,minwidth=65,stretch=False,anchor='w' if key in ('model','product_name','option_name','option_id','state') else 'e')
+        self.sheet.tag_configure('urgent',foreground=RED,background='#fff0f0')
+        sv=ttk.Scrollbar(self.sheet_frame,orient='vertical',command=self.sheet.yview)
+        sh=ttk.Scrollbar(self.sheet_frame,orient='horizontal',command=self.sheet.xview)
+        self.sheet.configure(yscrollcommand=sv.set,xscrollcommand=sh.set)
+        self.sheet.grid(row=0,column=0,sticky='nsew'); sv.grid(row=0,column=1,sticky='ns'); sh.grid(row=1,column=0,sticky='ew')
+        self.sheet_frame.rowconfigure(0,weight=1); self.sheet_frame.columnconfigure(0,weight=1)
+        self.sheet.bind('<<TreeviewSelect>>',self._sheet_select)
+        self.sheet.bind('<Double-1>',self._sheet_edit)
+        self.sheet.bind('<Return>',self._sheet_edit)
+        self.sheet.bind('<Control-c>',self._sheet_copy)
+        self.change_view(save=False)
+
+    def change_view(self, event=None, save=True):
+        excel = self.view_mode.get() == '엑셀형 보기'
+        for widget in (self.header,self.canvas,self.vbar,self.hbar):
+            widget.grid_remove() if excel else widget.grid()
+        if excel:
+            self.sheet_frame.grid(row=0,column=0,rowspan=3,columnspan=2,sticky='nsew')
+        else:
+            self.sheet_frame.grid_remove()
+        if save:
+            self.app.db.set_setting('rg_view_mode',self.view_mode.get())
+        self._render_sheet()
+
+    def _render_sheet(self):
+        if not hasattr(self,'sheet'):
+            return
+        self.sheet.delete(*self.sheet.get_children())
+        for i,row in enumerate(self.visible_rows):
+            values=[]
+            for key,_,_ in self.sheet_columns:
+                value=row.get(key)
+                if key=='sale_price': value=row['gross']['sale']
+                if key=='state' and urgent_stock(row): value='긴급 · '+value
+                values.append('—' if value is None else f'{value:.1f}' if key in ('days','margin_rate') else format_number(value) if isinstance(value,(int,float)) else value)
+            self.sheet.insert('', 'end', iid=str(i),values=values,tags=('urgent',) if urgent_stock(row) else ())
+        self.sheet.selection_set([str(i) for i,r in enumerate(self.visible_rows) if r['key'] in self.selected])
+
+    def _sheet_select(self, event=None):
+        visible={r['key'] for r in self.visible_rows}
+        chosen={self.visible_rows[int(i)]['key'] for i in self.sheet.selection()}
+        updated=(self.selected-visible)|chosen
+        if updated != self.selected:
+            self.selected=updated
+            self._selection_changed()
+
+    def _sheet_edit(self, event=None):
+        if event is not None and getattr(event,'num',None)==1 and not self.sheet.identify_row(event.y):
+            return 'break'
+        if self.sheet.selection(): self.edit_selected()
+        return 'break'
+
+    def _sheet_copy(self, event=None):
+        text='\n'.join('\t'.join(map(str,self.sheet.item(i,'values'))) for i in self.sheet.selection())
+        if text:
+            self.clipboard_clear(); self.clipboard_append(text)
+        return 'break'
 
     def clear_search(self):
         self.search.set('')
@@ -665,6 +743,7 @@ class RocketInventoryPage(tk.Frame):
         self.next_button.config(state='normal' if self.page_number < pages else 'disabled')
         self.canvas.configure(scrollregion=(0, 0, self._width, len(self.visible_rows)*self.ROW_HEIGHT))
         self.canvas.yview_moveto(0)
+        self._render_sheet()
         self._selection_changed()
 
     def _draw_viewport(self):
@@ -690,7 +769,9 @@ class RocketInventoryPage(tk.Frame):
         c, edges, y = self.canvas, self._columns(), index*self.ROW_HEIGHT
         selected = r['key'] in self.selected
         c.create_rectangle(0, y, self._width, y+self.ROW_HEIGHT,
-                           fill='#f1f6fe' if selected else BG, outline='')
+                           fill='#f1f6fe' if selected else '#fff0f0' if urgent_stock(r) else BG, outline='')
+        if urgent_stock(r):
+            c.create_rectangle(0,y,4,y+self.ROW_HEIGHT,fill=RED,outline='')
         c.create_line(0, y+self.ROW_HEIGHT-1, self._width, y+self.ROW_HEIGHT-1, fill=BORDER)
         for edge in edges[2:-1]:
             c.create_line(edge, y, edge, y+self.ROW_HEIGHT, fill='#e8edf3')
@@ -724,9 +805,9 @@ class RocketInventoryPage(tk.Frame):
         metric(2, 48, '7일', format_number(r['last7']))
         metric(2, 76, '30일', format_number(r['sales_30']), True)
         self._text(c, edges[2]+10, y+107, f'일일매출 {r["sales_recorded_days"]}/30일 조회', color=MUTED, size=8)
-        metric(3, 20, '판매가능', format_number(r['stock']), True)
+        metric(3, 20, '판매가능', format_number(r['stock']), True, color=RED if urgent_stock(r) else None)
         text = '소진 예상 —' if r['days'] is None else f'소진 예상 {r["days"]:.1f}일'
-        self._text(c, edges[3]+10, y+45, text, color=ORANGE if r['state'] in ('품절 임박', '품절') else MUTED, size=8)
+        self._text(c, edges[3]+10, y+45, text, color=RED if urgent_stock(r) else MUTED, size=8)
         metric(3, 71, '입고중', format_number(r['pending']))
         metric(3, 100, '권장입고', format_number(r['recommended']), bg=PALE,
                color=BLUE if (r['recommended'] or 0) > 0 else MUTED)
@@ -751,7 +832,8 @@ class RocketInventoryPage(tk.Frame):
                        edges[6]-edges[5]-20, size=8), color=MUTED, size=8, tags=margin_tags)
         self._text(c, edges[6]-10, y+104, '마진 상세 ›', color=BLUE, size=9, anchor='ne', tags=margin_tags)
         state = r['state']
-        color = GREEN if state == '양호' else ORANGE if state in ('품절 임박', '품절') else MUTED
+        color = GREEN if state == '양호' else RED if urgent_stock(r) else MUTED
+        if urgent_stock(r): state='긴급 · '+state
         middle = (edges[6]+edges[7])/2
         self._text(c, middle, y+32, state, color=color, bold=True, anchor='center')
         tags = ('action:pending', f'row:{index}')
@@ -847,6 +929,10 @@ class RocketInventoryPage(tk.Frame):
         self._selection_changed()
 
     def _selection_changed(self):
+        if hasattr(self,'sheet'):
+            desired=tuple(str(i) for i,r in enumerate(self.visible_rows) if r['key'] in self.selected)
+            if self.sheet.selection()!=desired:
+                self.sheet.selection_set(desired)
         self.all_checked.set(bool(self.visible_rows) and all(r['key'] in self.selected for r in self.visible_rows))
         self.selection_label.config(text=f'검색 결과 {len(self.filtered_rows):,}개  ·  선택 {len(self.selected):,}개')
         self._generation += 1

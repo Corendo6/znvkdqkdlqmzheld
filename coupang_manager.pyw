@@ -31,7 +31,7 @@ import gross_margin
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.14"
+VERSION = "0.4.15"
 
 
 def resource_path(*parts):
