@@ -31,7 +31,7 @@ import gross_margin
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.15"
+VERSION = "0.4.16"
 
 
 def resource_path(*parts):
@@ -4001,11 +4001,24 @@ class CoupangManager(tk.Tk):
     def _poll_api_queue(self):
         try:
             # Keep redraw and input responsive even if many progress events arrive.
+            messages = []
             for _ in range(50):
                 try:
-                    msg = self.api_queue.get_nowait()
+                    messages.append(self.api_queue.get_nowait())
                 except queue.Empty:
                     break
+            # A completion refresh already includes the committed inventory and
+            # orders. Collapse redundant redraws only within this bounded batch;
+            # earlier stages still appear while the remaining API work runs.
+            latest = {msg[0]: i for i, msg in enumerate(messages)}
+            superseded_by = {
+                'status': ('status', 'sync_complete'),
+                'inventory_saved': ('inventory_saved', 'orders_saved', 'sync_complete'),
+                'orders_saved': ('orders_saved', 'sync_complete'),
+            }
+            for i, msg in enumerate(messages):
+                if any(latest.get(kind, -1) > i for kind in superseded_by.get(msg[0], ())):
+                    continue
                 try:
                     self._handle_api_message(msg)
                 except Exception:

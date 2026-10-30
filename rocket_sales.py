@@ -266,15 +266,19 @@ def rebuild_sales(conn, vendor, start=None, end=None, option_ids=None):
         sale_where += f' AND option_id IN ({marks})'
         params += list(option_ids)
         sale_params += list(option_ids)
-    raw = conn.execute('SELECT * FROM rg_order_items WHERE ' + where, params).fetchall()
+    # Stream only the fields needed for aggregation; raw history can grow large.
+    raw = conn.execute('SELECT paid_date,option_id,quantity,revenue,product_name FROM rg_order_items WHERE ' + where, params)
     current = conn.execute('SELECT * FROM sales WHERE ' + sale_where, sale_params).fetchall()
     grouped, owned = {}, {}
     for row in raw:
         key = (row['paid_date'], row['option_id'])
-        group = grouped.setdefault(key, dict(quantity=0, revenue=Decimal(0), orders=set(), product=row['product_name']))
+        group = grouped.get(key)
+        if group is None:
+            group = grouped[key] = dict(quantity=0, revenue=Decimal(0), orders=0, product=row['product_name'])
         group['quantity'] += row['quantity']
         group['revenue'] += Decimal(row['revenue'])
-        group['orders'].add(row['order_id'])
+        # The (vendor, order, option) primary key permits one row per order here.
+        group['orders'] += 1
     for row in current:
         owned.setdefault((row['sale_date'], row['option_id']), []).append(row)
     mappings = {r['option_id']: r['model'] for r in conn.execute('SELECT option_id,model FROM option_model_map') if r['model']}
@@ -282,19 +286,22 @@ def rebuild_sales(conn, vendor, start=None, end=None, option_ids=None):
     for r in conn.execute("SELECT * FROM products WHERE fulfillment_type='로켓그로스' ORDER BY updated_at DESC,id DESC"):
         products.setdefault(str(r['option_id'] or ''), dict(r))
     # Index externally maintained totals once, not one SQL scan for every option.
-    external = {}
+    external_options, external_models = set(), set()
     for r in conn.execute("SELECT sale_date,option_id,model FROM sales WHERE method='로켓그로스' AND COALESCE(source,'')<>?", (source,)):
-        external.setdefault(r['sale_date'], []).append((str(r['option_id'] or ''), str(r['model'] or '')))
+        oid = str(r['option_id'] or '')
+        external_options.add((r['sale_date'], oid))
+        if not oid:
+            external_models.add((r['sale_date'], str(r['model'] or '')))
     pending = {(r['sale_date'], r['option_id']) for r in conn.execute("SELECT sale_date,option_id FROM sales_pending WHERE method='로켓그로스'")}
     result = dict(inserted=0, updated=0, unchanged=0, conflicts=0, unmapped=0)
+    unmatched, matched = {}, set()
     for key in sorted(set(grouped) | set(owned)):
         paid, oid = key
         rows = owned.get(key, [])
         group = grouped.get(key)
         product = products.get(oid, {})
         model = str(mappings.get(oid) or product.get('model') or '').strip()
-        conflict = key in pending or any(other_oid == oid or (not other_oid and model and other_model == model)
-                                        for other_oid, other_model in external.get(paid, []))
+        conflict = key in pending or key in external_options or bool(model and (paid, model) in external_models)
         if group is None or conflict:
             if rows:
                 conn.executemany('DELETE FROM sales WHERE id=?', [(r['id'],) for r in rows])
@@ -304,7 +311,7 @@ def rebuild_sales(conn, vendor, start=None, end=None, option_ids=None):
         name = str(product.get('option_name') or group['product'] or '')
         title = str(product.get('product_name') or group['product'] or '')
         registered = str(product.get('registered_product_id') or '')
-        values = (model, '로켓그로스', float(group['revenue']), len(group['orders']), group['quantity'],
+        values = (model, '로켓그로스', float(group['revenue']), group['orders'], group['quantity'],
                   oid, name, title, registered, source)
         if rows:
             fields = ('model','method','revenue','orders','quantity','option_id','option_name','product_name','registered_product_id','source')
@@ -315,19 +322,23 @@ def rebuild_sales(conn, vendor, start=None, end=None, option_ids=None):
                 result['updated'] += 1
             else:
                 result['unchanged'] += 1
-            conn.executemany('DELETE FROM sales WHERE id=?', [(r['id'],) for r in rows[1:]])
+            if len(rows) > 1:
+                conn.executemany('DELETE FROM sales WHERE id=?', [(r['id'],) for r in rows[1:]])
         else:
             conn.execute('''INSERT INTO sales(sale_date,model,method,revenue,orders,quantity,option_id,
                 option_name,product_name,registered_product_id,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)''', (paid,) + values)
             result['inserted'] += 1
         if not model:
             result['unmapped'] += 1
-            conn.execute('''INSERT INTO unmatched_options(option_id,option_name,product_name,registered_product_id,method)
-                VALUES (?,?,?,?,'로켓그로스') ON CONFLICT(option_id) DO UPDATE SET
-                option_name=excluded.option_name,product_name=excluded.product_name,last_seen=CURRENT_TIMESTAMP''',
-                         (oid, name, title, registered))
+            unmatched[oid] = (oid, name, title, registered)
         else:
-            conn.execute('DELETE FROM unmatched_options WHERE option_id=?', (oid,))
+            matched.add(oid)
+    # Each option needs one mapping update, regardless of how many days it sold.
+    conn.executemany('''INSERT INTO unmatched_options(option_id,option_name,product_name,registered_product_id,method)
+        VALUES (?,?,?,?,'로켓그로스') ON CONFLICT(option_id) DO UPDATE SET
+        option_name=excluded.option_name,product_name=excluded.product_name,last_seen=CURRENT_TIMESTAMP''',
+                     unmatched.values())
+    conn.executemany('DELETE FROM unmatched_options WHERE option_id=?', [(oid,) for oid in matched])
     return result
 
 

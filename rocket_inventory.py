@@ -524,18 +524,27 @@ class RocketInventoryPage(tk.Frame):
 
     def change_view(self, event=None, save=True):
         excel = self.view_mode.get() == '엑셀형 보기'
+        if excel and self.draw_job is not None:
+            self.after_cancel(self.draw_job)
+            self.draw_job = None
         for widget in (self.header,self.canvas,self.vbar,self.hbar):
             widget.grid_remove() if excel else widget.grid()
         if excel:
             self.sheet_frame.grid(row=0,column=0,rowspan=3,columnspan=2,sticky='nsew')
+            self._render_sheet()
         else:
             self.sheet_frame.grid_remove()
+            # Filters, pages, selections and thumbnails may have changed while hidden.
+            self.canvas.configure(scrollregion=(0, 0, self._width, len(self.visible_rows)*self.ROW_HEIGHT))
+            self.canvas.yview_moveto(0)
+            self._draw_signature = None
+            self._draw_header()
+            self._schedule_draw()
         if save:
             self.app.db.set_setting('rg_view_mode',self.view_mode.get())
-        self._render_sheet()
 
     def _render_sheet(self):
-        if not hasattr(self,'sheet'):
+        if not hasattr(self,'sheet') or self.view_mode.get() != '엑셀형 보기':
             return
         self.sheet.delete(*self.sheet.get_children())
         for i,row in enumerate(self.visible_rows):
@@ -549,6 +558,8 @@ class RocketInventoryPage(tk.Frame):
         self.sheet.selection_set([str(i) for i,r in enumerate(self.visible_rows) if r['key'] in self.selected])
 
     def _sheet_select(self, event=None):
+        if self.view_mode.get() != '엑셀형 보기':
+            return
         visible={r['key'] for r in self.visible_rows}
         chosen={self.visible_rows[int(i)]['key'] for i in self.sheet.selection()}
         updated=(self.selected-visible)|chosen
@@ -596,7 +607,7 @@ class RocketInventoryPage(tk.Frame):
         self.header.xview_moveto(first)
 
     def _schedule_draw(self):
-        if self.draw_job is None:
+        if self.view_mode.get() != '엑셀형 보기' and self.draw_job is None:
             self.draw_job = self.after_idle(self._draw_viewport)
 
     def _wheel(self, event):
@@ -722,6 +733,8 @@ class RocketInventoryPage(tk.Frame):
             canvas.create_line(x+3, y+7, x+6, y+10, x+12, y+3, fill=BG, width=2)
 
     def _draw_header(self):
+        if self.view_mode.get() == '엑셀형 보기':
+            return
         self.header.delete('all')
         edges = self._columns()
         self._checkbox(self.header, 10, 15, self.all_checked.get())
@@ -741,13 +754,16 @@ class RocketInventoryPage(tk.Frame):
         self.pager_label.config(text=f'{self.page_number} / {pages} 페이지')
         self.prev_button.config(state='normal' if self.page_number > 1 else 'disabled')
         self.next_button.config(state='normal' if self.page_number < pages else 'disabled')
-        self.canvas.configure(scrollregion=(0, 0, self._width, len(self.visible_rows)*self.ROW_HEIGHT))
-        self.canvas.yview_moveto(0)
+        if self.view_mode.get() != '엑셀형 보기':
+            self.canvas.configure(scrollregion=(0, 0, self._width, len(self.visible_rows)*self.ROW_HEIGHT))
+            self.canvas.yview_moveto(0)
         self._render_sheet()
         self._selection_changed()
 
     def _draw_viewport(self):
         self.draw_job = None
+        if self.view_mode.get() == '엑셀형 보기':
+            return
         top = max(0, self.canvas.canvasy(0))
         first = max(0, int(top//self.ROW_HEIGHT)-1)
         end = min(len(self.visible_rows), math.ceil((top+self.canvas.winfo_height())/self.ROW_HEIGHT)+1)
@@ -929,7 +945,7 @@ class RocketInventoryPage(tk.Frame):
         self._selection_changed()
 
     def _selection_changed(self):
-        if hasattr(self,'sheet'):
+        if hasattr(self,'sheet') and self.view_mode.get() == '엑셀형 보기':
             desired=tuple(str(i) for i,r in enumerate(self.visible_rows) if r['key'] in self.selected)
             if self.sheet.selection()!=desired:
                 self.sheet.selection_set(desired)
@@ -1147,7 +1163,8 @@ class RocketInventoryPage(tk.Frame):
 
     def _poll_images(self):
         changed = self.thumbnails.drain()
-        visible_urls = {str(r.get('image_url') or '') for r in self._drawn_rows.values()}
+        visible_urls = ({str(r.get('image_url') or '') for r in self._drawn_rows.values()}
+                        if self.view_mode.get() != '엑셀형 보기' else set())
         if changed & visible_urls:
             self._generation += 1
             self._schedule_draw()
