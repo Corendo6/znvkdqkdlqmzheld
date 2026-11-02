@@ -14,7 +14,8 @@ if errorlevel 1 goto no_python
 set "PYEXE=python.exe"
 set "PYOPT="
 :python_found
-%PYEXE% %PYOPT% -c "import openpyxl, PIL" >nul 2>&1
+rem Check installation without loading the Excel/image libraries before startup.
+%PYEXE% %PYOPT% -c "import importlib.util, sys; sys.exit(0 if all(importlib.util.find_spec(name) for name in ('openpyxl', 'PIL')) else 1)" >nul 2>&1
 if errorlevel 1 %PYEXE% %PYOPT% -m pip install openpyxl pillow
 if errorlevel 1 goto failed
 %PYEXE% %PYOPT% "coupang_manager.pyw"

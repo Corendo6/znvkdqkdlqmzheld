@@ -31,7 +31,7 @@ import gross_margin
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.16"
+VERSION = "0.4.17"
 
 
 def resource_path(*parts):
@@ -1037,9 +1037,11 @@ class ExcelImportDialog(tk.Toplevel):
 
 class CoupangManager(tk.Tk):
     def __init__(self):
+        started = time.monotonic()
         super().__init__()
         ensure_database()
         self.db = Database(DB_PATH)
+        database_ready = time.monotonic()
         self.api_queue = queue.Queue()
         self.api_busy = False
         self.api_cancel_event = threading.Event()
@@ -1053,16 +1055,22 @@ class CoupangManager(tk.Tk):
         self._style()
         self._build_shell()
         self.show_page("product_dashboard")
+        LOGGER.info("시작 준비 DB %.3f초 / 첫 화면 %.3f초", database_ready - started,
+                    time.monotonic() - started)
         self._search_dialog = None
         self.bind('<F5>', self.open_search_dialog)
         self.after(200, self._poll_api_queue)
-        # v0.3.7: do not hold a write lock during application construction.
-        # Run model-link repair after the window is ready and keep it non-fatal.
+        # Restore saved option mappings after the window is ready. Name-based
+        # inference belongs to explicit repair/import/sync, never the UI startup.
         self.after(700, self._startup_model_repair)
 
     def _startup_model_repair(self):
+        if self.api_busy:
+            # An API worker may already own the writer; do not make the UI wait.
+            return
+        started = time.monotonic()
         try:
-            repair = self._auto_repair_model_links(self.db)
+            repair = self._auto_repair_model_links(self.db, infer_missing=False)
             if repair.get('linked') or repair.get('pendingLinked') or repair.get('salesMoved'):
                 LOGGER.info("모델 자동연결 복구 linked=%s pendingLinked=%s salesMoved=%s",
                             repair.get('linked',0), repair.get('pendingLinked',0), repair.get('salesMoved',0))
@@ -1081,6 +1089,8 @@ class CoupangManager(tk.Tk):
             LOGGER.exception("시작 시 모델 자동연결 복구 실패")
         except Exception:
             LOGGER.exception("시작 시 모델 자동연결 복구 실패")
+        finally:
+            LOGGER.info("시작 시 저장된 모델 연결 복원 %.3f초", time.monotonic() - started)
 
     def _style(self):
         style = ttk.Style(self)
@@ -2499,9 +2509,10 @@ class CoupangManager(tk.Tk):
         db.conn.execute("UPDATE products SET model=?,updated_at=CURRENT_TIMESTAMP WHERE option_id=? AND COALESCE(TRIM(model),'')=''",(model,oid))
         return True
 
-    def _auto_link_missing_models(self, db=None, examples=None):
+    def _auto_link_missing_models(self, db=None, examples=None, *, infer_missing=True):
         db=db or self.db
-        examples=examples or self._build_model_match_examples(db)
+        if infer_missing and examples is None:
+            examples=self._build_model_match_examples(db)
         rows=db.query("""SELECT id,option_id,option_name,product_name,display_name
                          FROM products WHERE COALESCE(TRIM(model),'')=''
                            AND COALESCE(TRIM(option_id),'')<>'' ORDER BY id""")
@@ -2512,6 +2523,8 @@ class CoupangManager(tk.Tk):
             if existing:
                 db.conn.execute("UPDATE products SET model=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND COALESCE(TRIM(model),'')=''",(existing,r['id']))
                 linked+=1
+                continue
+            if not infer_missing:
                 continue
             model,best,second=self._infer_model_from_text(r['option_name'],r['product_name'],r['display_name'],db,examples)
             if model:
@@ -2541,11 +2554,11 @@ class CoupangManager(tk.Tk):
         db.conn.commit()
         return linked
 
-    def _auto_repair_model_links(self, db=None):
+    def _auto_repair_model_links(self, db=None, *, infer_missing=True):
         db=db or self.db
-        examples=self._build_model_match_examples(db)
-        products=self._auto_link_missing_models(db,examples)
-        pending_linked=self._auto_link_pending_models(db,examples)
+        examples=self._build_model_match_examples(db) if infer_missing else None
+        products=self._auto_link_missing_models(db,examples,infer_missing=infer_missing)
+        pending_linked=self._auto_link_pending_models(db,examples) if infer_missing else 0
         moved=0
         if db is self.db:
             m=self._materialize_pending_sales()
