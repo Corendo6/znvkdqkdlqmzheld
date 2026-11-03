@@ -519,8 +519,8 @@ class RocketInventoryPage(tk.Frame):
         style.configure('Inventory.Treeview', rowheight=30, font=(self.font,10), foreground=INK)
         style.configure('Inventory.Treeview.Heading', font=(self.font,10,'bold'), padding=(6,8))
         self.sheet.configure(style='Inventory.Treeview', displaycolumns=(
-            'model','option_name','stock','pending','last7','gap7','recommended','days','state',
-            'product_name','option_id','yesterday','sales_30','sale_price','unit_cost','margin','margin_rate'))
+            'product_name','option_name','stock','pending','last7','gap7','recommended','days','state',
+            'option_id','yesterday','sales_30','sale_price','unit_cost','margin','margin_rate'))
         self.sheet.tag_configure('even',background='#ffffff',foreground=INK)
         self.sheet.tag_configure('odd',background='#f0f4f8',foreground=INK)
         self.sheet.tag_configure('urgent',foreground='#8b2525',background='#fff0ed')
