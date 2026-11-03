@@ -32,7 +32,7 @@ import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.18"
+VERSION = "0.4.19"
 
 
 def resource_path(*parts):

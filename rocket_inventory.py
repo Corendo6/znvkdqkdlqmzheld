@@ -219,6 +219,10 @@ def build_rows(app, now=None):
     for oid, snapshot in snapshots.items():
         if oid not in products:
             products[oid] = dict(option_id=oid, product_name='상품정보 연결 필요', model='', id=None)
+    if hasattr(app, 'multitap_only_enabled') and app.multitap_only_enabled():
+        allowed = {str(r['option_id'] or '').strip() for r in app.db.query(
+            'SELECT p.option_id FROM products p WHERE ' + app._multitap_product_clause('p'))}
+        products = {oid: product for oid, product in products.items() if oid in allowed}
     daily = rocket_sales.daily_quantities(app.db.conn, vendor, now.date())
     context = gross_margin.load_context(app.db)
     rows = []
@@ -506,12 +510,21 @@ class RocketInventoryPage(tk.Frame):
             ('option_id','옵션 ID',120),('yesterday','어제 판매',85),('last7','7일 판매',85),
             ('sales_30','30일 판매',85),('stock','판매가능',85),('pending','입고중',85),
             ('recommended','권장입고',85),('days','소진 예상(일)',100),('state','재고 상태',110),
-            ('sale_price','판매가',100),('unit_cost','원가',90),('margin','개당 마진',100),('margin_rate','마진율(%)',95)]
+            ('sale_price','판매가',100),('unit_cost','원가',90),('margin','개당 마진',100),('margin_rate','마진율(%)',95),('gap7','7일×2.5 부족분',125)]
         self.sheet = ttk.Treeview(self.sheet_frame, columns=[k for k,_,_ in self.sheet_columns], show='headings', selectmode='extended')
         for key,label,width in self.sheet_columns:
             self.sheet.heading(key,text=label)
             self.sheet.column(key,width=width,minwidth=65,stretch=False,anchor='w' if key in ('model','product_name','option_name','option_id','state') else 'e')
-        self.sheet.tag_configure('urgent',foreground=RED,background='#fff0f0')
+        style = ttk.Style(self)
+        style.configure('Inventory.Treeview', rowheight=30, font=(self.font,10), foreground=INK)
+        style.configure('Inventory.Treeview.Heading', font=(self.font,10,'bold'), padding=(6,8))
+        self.sheet.configure(style='Inventory.Treeview', displaycolumns=(
+            'model','option_name','stock','pending','last7','gap7','recommended','days','state',
+            'product_name','option_id','yesterday','sales_30','sale_price','unit_cost','margin','margin_rate'))
+        self.sheet.tag_configure('even',background='#ffffff',foreground=INK)
+        self.sheet.tag_configure('odd',background='#f0f4f8',foreground=INK)
+        self.sheet.tag_configure('urgent',foreground='#8b2525',background='#fff0ed')
+        ttk.Label(self.sheet_frame, text='7일×2.5 부족분 = 최근 7일 판매 × 2.5 − 판매가능 − 입고중  |  양수: 부족 / 음수: 여유 / —: 미확인').grid(row=2,column=0,sticky='w',pady=5)
         sv=ttk.Scrollbar(self.sheet_frame,orient='vertical',command=self.sheet.yview)
         sh=ttk.Scrollbar(self.sheet_frame,orient='horizontal',command=self.sheet.xview)
         self.sheet.configure(yscrollcommand=sv.set,xscrollcommand=sh.set)
@@ -552,10 +565,13 @@ class RocketInventoryPage(tk.Frame):
             values=[]
             for key,_,_ in self.sheet_columns:
                 value=row.get(key)
+                if key=='gap7':
+                    value = (row['last7']*2.5-row['stock']-row['pending']
+                             if row.get('usable') and all(row.get(k) is not None for k in ('last7','stock','pending')) else None)
                 if key=='sale_price': value=row['gross']['sale']
                 if key=='state' and urgent_stock(row): value='긴급 · '+value
-                values.append('—' if value is None else f'{value:.1f}' if key in ('days','margin_rate') else format_number(value) if isinstance(value,(int,float)) else value)
-            self.sheet.insert('', 'end', iid=str(i),values=values,tags=('urgent',) if urgent_stock(row) else ())
+                values.append('—' if value is None else f'{value:.1f}' if key in ('days','margin_rate') else f'{value:+,.1f}' if key=='gap7' else format_number(value) if isinstance(value,(int,float)) else value)
+            self.sheet.insert('', 'end', iid=str(i),values=values,tags=('urgent',) if urgent_stock(row) else ('odd' if i%2 else 'even',))
         self.sheet.selection_set([str(i) for i,r in enumerate(self.visible_rows) if r['key'] in self.selected])
 
     def _sheet_select(self, event=None):
@@ -575,7 +591,7 @@ class RocketInventoryPage(tk.Frame):
         return 'break'
 
     def _sheet_copy(self, event=None):
-        text='\n'.join('\t'.join(map(str,self.sheet.item(i,'values'))) for i in self.sheet.selection())
+        text='\n'.join('\t'.join(str(self.sheet.set(i, column)) for column in self.sheet['displaycolumns']) for i in self.sheet.selection())
         if text:
             self.clipboard_clear(); self.clipboard_append(text)
         return 'break'
