@@ -6,6 +6,7 @@ Missing observations remain unknown; inbound quantities are explicitly manual.
 """
 import csv
 import gross_margin
+import product_search
 import rocket_sales
 import hashlib
 import io
@@ -580,6 +581,8 @@ class RocketInventoryPage(tk.Frame):
         return 'break'
 
     def clear_search(self):
+        if hasattr(self.app, '_set_search_field'):
+            self.app._set_search_field('rocket_inventory', '전체')
         self.search.set('')
         self.apply_filters()
 
@@ -644,8 +647,10 @@ class RocketInventoryPage(tk.Frame):
         self.search_job = None
         if reset:
             self.page_number = 1
-        query = self.search.get().strip().casefold()
-        self.search_label.config(text=('검색: '+query[:10]+('…' if len(query)>10 else '')) if query else '')
+        query = self.search.get().strip()
+        field = self.app._search_field('rocket_inventory') if hasattr(self.app, '_search_field') else '전체'
+        field = product_search.normalize_field(field)
+        self.search_label.config(text=(field+': '+query[:10]+('…' if len(query)>10 else '')) if query else '')
         if query:
             self.clear_search_button.pack(side='left', after=self.search_label, padx=(0, 8))
         else:
@@ -653,7 +658,7 @@ class RocketInventoryPage(tk.Frame):
         kind = self.filter.get()
         rows = []
         for r in self.rows:
-            if query and query not in r['search_text']:
+            if not product_search.matches(r, query, field):
                 continue
             if kind == '입고 권장' and not (r['recommended'] is not None and r['recommended'] > 0):
                 continue

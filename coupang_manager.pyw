@@ -28,10 +28,11 @@ from tkinter import ttk, messagebox, filedialog
 import rocket_inventory
 import rocket_sales
 import gross_margin
+import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.17"
+VERSION = "0.4.18"
 
 
 def resource_path(*parts):
@@ -1048,6 +1049,7 @@ class CoupangManager(tk.Tk):
         self.api_started = 0
         self.api_last_status = 'API 갱신을 실행하면 진행 상황이 여기에 표시됩니다.'
         self.api_status_var = tk.StringVar(value=self.api_last_status)
+        self._search_fields = {}
         self.title(f"{APP_NAME}  v{VERSION}")
         self.geometry("1600x900")
         self.minsize(1180, 720)
@@ -1148,6 +1150,14 @@ class CoupangManager(tk.Tk):
         if master_section:
             self.master_tabs.select(self.master_models_tab if master_section == 'models' else self.master_fees_tab)
 
+    def _search_field(self, page):
+        return product_search.normalize_field(getattr(self, '_search_fields', {}).get(page, '전체'))
+
+    def _set_search_field(self, page, field):
+        if not hasattr(self, '_search_fields'):
+            self._search_fields = {}
+        self._search_fields[page] = product_search.normalize_field(field)
+
     def _search_target(self, page):
         """Use each page's existing local filter, without rebuilding the page."""
         if page == 'rocket_inventory':
@@ -1189,9 +1199,16 @@ class CoupangManager(tk.Tk):
         box = ttk.Frame(dialog, padding=20)
         box.pack(fill='both', expand=True)
         ttk.Label(box, text=titles[page] + ' 검색', font=('맑은 고딕', 12, 'bold')).pack(anchor='w')
-        hint = ('모델·옵션 매핑 탭에서 모델명·품명·분류를 검색합니다.' if page == 'master' else
+        hint = ('모델·옵션 매핑 탭에서 연결된 상품 정보까지 검색합니다.' if page == 'master' else
                 '검색하면 상품 관리로 이동합니다.' if fallback else '현재 화면의 필터를 유지하여 검색합니다.')
         ttk.Label(box, text=hint, foreground='#666').pack(anchor='w', pady=(5, 12))
+        field_box = ttk.Frame(box)
+        field_box.pack(fill='x', pady=(0, 8))
+        ttk.Label(field_box, text='검색 항목').pack(side='left', padx=(0, 8))
+        dialog.search_field = tk.StringVar(dialog, value='전체' if fallback else self._search_field(page))
+        dialog.field_combo = ttk.Combobox(field_box, textvariable=dialog.search_field,
+                                        values=product_search.FIELDS, state='readonly', width=20)
+        dialog.field_combo.pack(side='left')
         dialog.search_var = tk.StringVar(dialog, value=initial)
         entry = ttk.Entry(box, textvariable=dialog.search_var, width=42, font=('맑은 고딕', 11))
         dialog.search_entry = entry
@@ -1209,9 +1226,11 @@ class CoupangManager(tk.Tk):
 
         def apply(event=None):
             query = dialog.search_var.get().strip()
+            field = dialog.search_field.get() if query else '전체'
             close()
             if self.current_page != page:
                 self.show_page(page)
+            self._set_search_field(page, field)
             if page == 'margin':
                 self.gross_margin_notebook.select(0)
             elif page == 'master':
@@ -1500,6 +1519,7 @@ class CoupangManager(tk.Tk):
         self._pending_product_filter = str(special_filter or '')
         self.show_page('products')
         if query and hasattr(self,'prod_q'):
+            self._set_search_field('products', '전체')
             self.prod_q.set(str(query))
         if sale_status and hasattr(self,'prod_sale_status'):
             self.prod_sale_status.set(str(sale_status))
@@ -1882,9 +1902,9 @@ class CoupangManager(tk.Tk):
 
     def _product_query_rows(self):
         raw_q=self.prod_q.get().strip(); ft=self.prod_fulfillment.get() if hasattr(self,'prod_fulfillment') else '전체'; sale_st=self.prod_sale_status.get() if hasattr(self,'prod_sale_status') else '전체'
-        like=f"%{raw_q}%"; digits=''.join(ch for ch in raw_q if ch.isdigit()); id_term=digits if len(digits)>=6 else raw_q; id_like=f"%{id_term}%"
-        sql=("SELECT p.* FROM products p WHERE (COALESCE(p.model,'') LIKE ? OR COALESCE(p.product_name,'') LIKE ? OR COALESCE(p.display_name,'') LIKE ? OR COALESCE(p.option_name,'') LIKE ? OR COALESCE(p.registered_product_id,'') LIKE ? OR COALESCE(p.exposed_product_id,'') LIKE ? OR COALESCE(p.option_id,'') LIKE ? OR COALESCE(p.seller_product_item_id,'') LIKE ?)")
-        params=[like,like,like,like,id_like,id_like,id_like,id_like]
+        clause,params=product_search.sql_clause(raw_q,self._search_field('products'),alias='p')
+        id_term=product_search.id_term(raw_q)
+        sql="SELECT p.* FROM products p WHERE " + clause
         if self.multitap_only_enabled(): sql += ' AND ' + self._multitap_product_clause('p')
         if self.product_hide_rocket_enabled(): sql += " AND TRIM(COALESCE(p.fulfillment_type,''))<>'로켓그로스'"
         if ft and ft!='전체': sql+=" AND COALESCE(NULLIF(p.fulfillment_type,''),'판매자배송')=?"; params.append(ft)
@@ -1905,12 +1925,13 @@ class CoupangManager(tk.Tk):
 
     def clear_product_search(self):
         self.prod_q.set('')
+        self._set_search_field('products', '전체')
         self._reset_product_page_and_refresh()
 
     def refresh_products(self):
         if hasattr(self,'prod_search_label') and self.prod_search_label.winfo_exists():
             query=self.prod_q.get().strip()
-            self.prod_search_label.configure(text=('검색: '+query[:28]+('…' if len(query)>28 else '')) if query else '')
+            self.prod_search_label.configure(text=(self._search_field('products')+': '+query[:28]+('…' if len(query)>28 else '')) if query else '')
         rows=self._product_query_rows(); hist=self._exposure_history_map(); hist_counts=self._exposure_history_count_map()
         if getattr(self,'prod_exposure_only',None) and self.prod_exposure_only.get():
             rows=[r for r in rows if len(hist.get(self._exposure_option_key(r), [])) > 1]
@@ -2313,10 +2334,9 @@ class CoupangManager(tk.Tk):
 
     def run_search(self):
         q=self.search_q.get().strip(); self.search_tree.delete(*self.search_tree.get_children())
-        if not q: self.search_label.config(text='검색어를 입력하세요.'); return
-        like=f"%{q}%"; digits=''.join(ch for ch in q if ch.isdigit()); id_term=digits if len(digits)>=6 else q; id_like=f"%{id_term}%"
-        sql=("SELECT p.* FROM products p WHERE (COALESCE(p.model,'') LIKE ? OR COALESCE(p.product_name,'') LIKE ? OR COALESCE(p.display_name,'') LIKE ? OR COALESCE(p.option_name,'') LIKE ? OR COALESCE(p.registered_product_id,'') LIKE ? OR COALESCE(p.exposed_product_id,'') LIKE ? OR COALESCE(p.option_id,'') LIKE ? OR COALESCE(p.seller_product_item_id,'') LIKE ?)")
-        params=[like,like,like,like,id_like,id_like,id_like,id_like]
+        clause,params=product_search.sql_clause(q,self._search_field('search'))
+        id_term=product_search.id_term(q)
+        sql='SELECT p.* FROM products p WHERE '+clause
         if self.multitap_only_enabled(): sql += ' AND ' + self._multitap_product_clause('p')
         sql += (" ORDER BY CASE WHEN COALESCE(p.option_id,'')=? THEN 0 WHEN COALESCE(p.seller_product_item_id,'')=? THEN 1 WHEN COALESCE(p.registered_product_id,'')=? THEN 2 WHEN COALESCE(p.exposed_product_id,'')=? THEN 3 ELSE 4 END,p.model,p.fulfillment_type,p.sale_status,p.status,p.id")
         params.extend([id_term,id_term,id_term,id_term]); rows=self.db.query(sql,params); self.search_label.config(text=f"검색 결과: {len(rows)}건")
@@ -2681,6 +2701,7 @@ class CoupangManager(tk.Tk):
 
     def clear_model_search(self):
         self.model_q.set('')
+        self._set_search_field('master', '전체')
         self.refresh_model_master()
 
     def _build_model_master(self, parent):
@@ -2730,21 +2751,44 @@ class CoupangManager(tk.Tk):
 
     def refresh_model_master(self):
         self._sync_option_model_map_from_products()
-        q='%' + (self.model_q.get().strip() if hasattr(self,'model_q') else '') + '%'
+        query=self.model_q.get().strip() if hasattr(self,'model_q') else ''
+        field=self._search_field('master')
+        master_clause,master_params=product_search.sql_clause(query,field,alias='m',columns=('model','product_name'))
+        product_clause,product_params=product_search.sql_clause(query,field)
+        if query:
+            if field=='전체':
+                escaped=query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')
+                master_clause=f"({master_clause} OR COALESCE(m.category,'') LIKE ? ESCAPE '\\')"
+                master_params.append('%'+escaped+'%')
+            mapping_clause,mapping_params=product_search.sql_clause(query,field,alias='om',columns=('model','option_id'))
+            master_clause=f'''({master_clause} OR m.model IN (
+                SELECT COALESCE(NULLIF(TRIM(p.model),''),TRIM(om.model))
+                FROM products p LEFT JOIN option_model_map om ON om.option_id=p.option_id
+                WHERE {product_clause}) OR m.model IN (
+                SELECT om.model FROM option_model_map om WHERE {mapping_clause}))'''
+            master_params+=product_params+mapping_params
         if hasattr(self,'model_tree') and self.model_tree.winfo_exists():
             self.model_tree.delete(*self.model_tree.get_children())
-            rows=self.db.query("""SELECT * FROM model_master WHERE model LIKE ? OR COALESCE(product_name,'') LIKE ? OR COALESCE(category,'') LIKE ? ORDER BY category COLLATE NOCASE, model COLLATE NOCASE""",(q,q,q))
+            rows=self.db.query('SELECT m.* FROM model_master m WHERE '+master_clause+
+                               ' ORDER BY m.category COLLATE NOCASE,m.model COLLATE NOCASE',master_params)
             for r in rows:
                 self.model_tree.insert('', 'end', iid=str(r['model']), values=(r['model'],r['category'],r['product_name'],r['color'],r['package_type'],money(r['pack_qty']) if r['pack_qty'] is not None else '',money(r['supply_price']) if r['supply_price'] is not None else '',money(r['coupang_price']) if r['coupang_price'] is not None else '',r['source_sheet']))
         if hasattr(self,'unmatched_tree') and self.unmatched_tree.winfo_exists():
             self.unmatched_tree.delete(*self.unmatched_tree.get_children())
-            for r in self.db.query('SELECT * FROM unmatched_options ORDER BY last_seen DESC, option_id'):
+            unmatched_clause,unmatched_params=product_search.sql_clause(query,field,alias='u',
+                columns=('option_id','option_name','product_name','registered_product_id'))
+            if query:
+                unmatched_clause=f'''({unmatched_clause} OR (COALESCE(u.option_id,'')<>''
+                    AND u.option_id IN (SELECT p.option_id FROM products p WHERE {product_clause})))'''
+                unmatched_params+=product_params
+            for r in self.db.query('SELECT u.* FROM unmatched_options u WHERE '+unmatched_clause+
+                                   ' ORDER BY u.last_seen DESC,u.option_id',unmatched_params):
                 self.unmatched_tree.insert('', 'end', iid=str(r['option_id']), values=(r['option_id'],r['option_name'],r['product_name'],r['registered_product_id'],r['method'],r['first_seen'],r['last_seen']))
         master=self.db.one('SELECT COUNT(*) n FROM model_master')['n']; mappings=self.db.one('SELECT COUNT(*) n FROM option_model_map')['n']; unmatched=self.db.one('SELECT COUNT(*) n FROM unmatched_options')['n']; pending=self.db.one('SELECT COUNT(*) n FROM sales_pending')['n']
         missing=self.db.one("""SELECT COUNT(DISTINCT p.model) n FROM products p LEFT JOIN model_master m ON m.model=p.model WHERE COALESCE(TRIM(p.model),'')<>'' AND m.model IS NULL""")['n']
         if hasattr(self,'model_summary') and self.model_summary.winfo_exists():
             query=self.model_q.get().strip()
-            search_label=(' · 검색: '+query[:35]+('…' if len(query)>35 else '')) if query else ''
+            search_label=(' · '+field+' 검색: '+query[:35]+('…' if len(query)>35 else '')) if query else ''
             self.model_summary.config(text=f'마스터 {master} · 옵션매핑 {mappings} · 미매칭 {unmatched} · 대기매출 {pending} · 단가표 미등록 모델 {missing}'+search_label)
 
     def _upsert_sale_from_mapping(self, sale_date, model, method, revenue, orders, qty, option_id='', option_name='', product_name='', registered_product_id='', source=''):
@@ -2957,6 +3001,7 @@ class CoupangManager(tk.Tk):
         for product in products:
             row=gross_margin.evaluate(product,context)
             row['link']=self._resolved_product_link(product)
+            row['search_product']=dict(product, model=row['model'])
             out.append(row)
         return out
 
@@ -3012,11 +3057,11 @@ class CoupangManager(tk.Tk):
             return
         for iid in tree.get_children(): tree.delete(iid)
         rows=self._gross_margin_data(); self.gross_margin_row_cache={}
-        q=(self.gross_margin_search.get().strip().lower() if hasattr(self,'gross_margin_search') else '')
+        q=(self.gross_margin_search.get().strip() if hasattr(self,'gross_margin_search') else '')
+        field=self._search_field('margin')
         missing_only=bool(self.gross_margin_missing.get()) if hasattr(self,'gross_margin_missing') else False
         for r in rows:
-            hay=' '.join([r['model'],r['option_name'],r['option_id'],r['product_name'],r['registered_product_id']]).lower()
-            if q and q not in hay: continue
+            if not product_search.matches(r.get('search_product', r), q, field): continue
             if missing_only and not r['missing']: continue
             status=r['sale_status'] or '미확인'
             status={'판매중':'● 판매중','품절':'▲ 품절','판매중지':'■ 판매중지'}.get(status,'? '+status)
@@ -3305,7 +3350,7 @@ class CoupangManager(tk.Tk):
             w.grid(row=0,column=i*2+1,padx=(0,10))
         ttk.Button(top,text='추가',style='Accent.TButton',command=self.add_sale).grid(row=0,column=12)
         bar=ttk.Frame(self.content); bar.pack(fill='x',pady=(0,8)); self.sales_q=tk.StringVar()
-        ttk.Label(bar,text='모델/옵션ID 검색').pack(side='left'); e=ttk.Entry(bar,textvariable=self.sales_q,width=25); e.pack(side='left',padx=6); ttk.Button(bar,text='조회',command=self.refresh_sales).pack(side='left')
+        ttk.Button(bar,text='F5 검색',command=self.open_search_dialog).pack(side='left'); e=ttk.Entry(bar,textvariable=self.sales_q,width=25); e.pack(side='left',padx=6); ttk.Button(bar,text='조회',command=self.refresh_sales).pack(side='left')
         ttk.Button(bar,text='쿠팡 일일매출 Excel',style='Accent.TButton',command=self.import_coupang_sales_excel).pack(side='right')
         ttk.Button(bar,text='기존 Excel 가져오기',command=self.import_excel_workbook).pack(side='right',padx=6)
         ttk.Button(bar,text='CSV 가져오기',command=self.import_sales_csv).pack(side='right'); ttk.Button(bar,text='CSV 내보내기',command=self.export_sales_csv).pack(side='right',padx=6); ttk.Button(bar,text='선택 삭제',style='Danger.TButton',command=self.delete_sale).pack(side='right')
@@ -3331,20 +3376,35 @@ class CoupangManager(tk.Tk):
 
     def refresh_sales(self):
         term=self.sales_q.get().strip() if hasattr(self,'sales_q') else ''
-        q=f"%{term}%"
+        field=self._search_field('sales')
+        clause,params=product_search.sql_clause(term,field,alias='s',
+            columns=('model','option_id','option_name','product_name','registered_product_id'))
+        if term:
+            product_clause,product_params=product_search.sql_clause(term,field)
+            # An identified option must never pick up another option's IDs just
+            # because both options happen to share a model. Model-only legacy
+            # sales can still use the catalog for names and exposure IDs.
+            clause=f'''({clause} OR
+                (COALESCE(TRIM(s.option_id),'')<>'' AND TRIM(s.option_id) IN (
+                    SELECT p.option_id FROM products p WHERE {product_clause})) OR
+                (COALESCE(TRIM(s.option_id),'')='' AND COALESCE(TRIM(s.model),'')<>''
+                    AND TRIM(s.model) IN (SELECT p.model FROM products p WHERE {product_clause})))'''
+            params+=product_params+product_params
         vendor=self.db.setting('api_vendor_id','').strip()
         api_source=rocket_sales.SOURCE_PREFIX+vendor
-        missing_api="(COALESCE(model,'')='' AND source=?)"
+        missing_api="(COALESCE(s.model,'')='' AND s.source=?)"
+        sql='SELECT s.* FROM sales s WHERE '+clause
         if self.multitap_only_enabled():
             allowed=self.visible_models()
             if allowed:
                 marks=','.join('?' for _ in allowed)
-                sql=f"SELECT * FROM sales WHERE (model LIKE ? OR COALESCE(option_id,'') LIKE ? OR COALESCE(option_name,'') LIKE ?) AND (model IN ({marks}) OR {missing_api}) ORDER BY sale_date DESC,id DESC LIMIT 2500"
-                rows=self.db.query(sql,[q,q,q,*allowed,api_source])
+                sql+=f' AND (s.model IN ({marks}) OR {missing_api})'
+                params+=[*allowed,api_source]
             else:
-                rows=self.db.query(f"SELECT * FROM sales WHERE {missing_api} AND (COALESCE(option_id,'') LIKE ? OR COALESCE(option_name,'') LIKE ?) ORDER BY sale_date DESC,id DESC LIMIT 2500",(api_source,q,q))
-        else:
-            rows=self.db.query("SELECT * FROM sales WHERE model LIKE ? OR COALESCE(option_id,'') LIKE ? OR COALESCE(option_name,'') LIKE ? ORDER BY sale_date DESC,id DESC LIMIT 2500",(q,q,q))
+                sql+=' AND '+missing_api
+                params.append(api_source)
+        sql+=' ORDER BY s.sale_date DESC,s.id DESC LIMIT 2500'
+        rows=self.db.query(sql,params)
         self.sales_tree.delete(*self.sales_tree.get_children())
         for r in rows:
             self.sales_tree.insert('', 'end',iid=str(r['id']),values=(r['id'],r['sale_date'],r['model'] or '모델 연결 필요',r['option_id'] or '',r['option_name'] or '',r['method'],money(r['revenue']),money(r['orders']),money(r['quantity']),rocket_sales.source_label(r['source'])))
