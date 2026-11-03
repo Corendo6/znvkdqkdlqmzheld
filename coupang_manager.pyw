@@ -2326,11 +2326,11 @@ class CoupangManager(tk.Tk):
     # ---------------- Search ----------------
     def build_search(self):
         self.page_header("상품 검색", "모델명·상품명·등록상품 ID·노출상품 ID·옵션 ID를 통합 검색합니다.")
-        bar=ttk.Frame(self.content); bar.pack(fill='x',pady=(0,12)); self.search_q=tk.StringVar(value='HMP33L')
-        ent=ttk.Entry(bar,textvariable=self.search_q,width=40,font=('맑은 고딕',12)); ent.pack(side='left',ipady=4); ttk.Button(bar,text='검색',style='Accent.TButton',command=self.run_search).pack(side='left',padx=8); self.search_label=ttk.Label(bar,text=''); self.search_label.pack(side='left',padx=8)
+        bar=ttk.Frame(self.content); bar.pack(fill='x',pady=(0,12)); self.search_q=tk.StringVar()
+        ttk.Button(bar,text='F5 검색',command=self.open_search_dialog).pack(side='left'); self.search_label=ttk.Label(bar,text=''); self.search_label.pack(side='left',padx=8)
         cols=[('fulfillment','배송'),('sale_status','판매상태'),('model','모델명'),('product','상품명'),('display','노출명'),('regid','등록상품 ID'),('pid','노출상품 ID'),('option','옵션명'),('oid','옵션 ID'),('selleritemid','업체옵션 ID'),('gift','사은품'),('sale','판매가'),('coupon','쿠폰가'),('map','지도가'),('diff','가격차'),('link','링크')]
         self.search_tree=self.make_tree(self.content,cols,{'fulfillment':95,'sale_status':105,'model':115,'product':250,'display':280,'option':190,'link':220,'regid':120,'pid':115,'oid':120,'selleritemid':125}); self.search_tree.bind('<Double-1>',self.search_open_link)
-        ent.bind('<Return>',lambda e:self.run_search()); ent.focus_set(); self.run_search()
+        self.run_search()
 
     def run_search(self):
         q=self.search_q.get().strip(); self.search_tree.delete(*self.search_tree.get_children())
@@ -3014,8 +3014,7 @@ class CoupangManager(tk.Tk):
 
         tools=ttk.Frame(bulk); tools.pack(fill='x',pady=(0,8))
         self.gross_margin_search=tk.StringVar(); self.gross_margin_missing=tk.BooleanVar(value=False)
-        ttk.Label(tools,text='검색',style='Filter.TLabel').pack(side='left')
-        ent=ttk.Entry(tools,textvariable=self.gross_margin_search,width=28); ent.pack(side='left',padx=(6,8)); ent.bind('<Return>',lambda e:self.refresh_gross_margin())
+        ttk.Button(tools,text='F5 검색',command=self.open_search_dialog).pack(side='left')
         ttk.Checkbutton(tools,text='미확인만',variable=self.gross_margin_missing,command=self.refresh_gross_margin).pack(side='left',padx=4)
         ttk.Button(tools,text='조회',style='Toolbar.TButton',command=self.refresh_gross_margin).pack(side='left',padx=4)
         ttk.Button(tools,text='선택 수정',style='Toolbar.TButton',command=self.edit_selected_gross_margin).pack(side='left',padx=4)
@@ -3350,13 +3349,13 @@ class CoupangManager(tk.Tk):
             w.grid(row=0,column=i*2+1,padx=(0,10))
         ttk.Button(top,text='추가',style='Accent.TButton',command=self.add_sale).grid(row=0,column=12)
         bar=ttk.Frame(self.content); bar.pack(fill='x',pady=(0,8)); self.sales_q=tk.StringVar()
-        ttk.Button(bar,text='F5 검색',command=self.open_search_dialog).pack(side='left'); e=ttk.Entry(bar,textvariable=self.sales_q,width=25); e.pack(side='left',padx=6); ttk.Button(bar,text='조회',command=self.refresh_sales).pack(side='left')
+        ttk.Button(bar,text='F5 검색',command=self.open_search_dialog).pack(side='left'); ttk.Button(bar,text='조회',command=self.refresh_sales).pack(side='left',padx=6)
         ttk.Button(bar,text='쿠팡 일일매출 Excel',style='Accent.TButton',command=self.import_coupang_sales_excel).pack(side='right')
         ttk.Button(bar,text='기존 Excel 가져오기',command=self.import_excel_workbook).pack(side='right',padx=6)
         ttk.Button(bar,text='CSV 가져오기',command=self.import_sales_csv).pack(side='right'); ttk.Button(bar,text='CSV 내보내기',command=self.export_sales_csv).pack(side='right',padx=6); ttk.Button(bar,text='선택 삭제',style='Danger.TButton',command=self.delete_sale).pack(side='right')
         cols=[('id','ID'),('date','날짜'),('model','모델명'),('oid','옵션 ID'),('option','옵션명'),('method','판매방식'),('revenue','매출(원)'),('orders','주문'),('qty','판매량'),('source','자료 출처')]
         self.sales_tree=self.make_tree(self.content,cols,{'id':55,'date':105,'model':120,'oid':125,'option':230,'method':105,'revenue':120,'orders':65,'qty':65,'source':180})
-        e.bind('<Return>',lambda x:self.refresh_sales()); self.refresh_sales()
+        self.refresh_sales()
         self._update_api_controls()
 
     def sync_recent_daily_sales(self):
