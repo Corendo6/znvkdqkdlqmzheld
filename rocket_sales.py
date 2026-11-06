@@ -1,6 +1,8 @@
 """Rocket Growth shipped orders, recorded by their Korean payment date."""
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+import api_query
+import read_models
 
 KST = timezone(timedelta(hours=9))
 SOURCE_PREFIX = 'rg-order-api:'
@@ -72,13 +74,11 @@ def daily_quantities(conn, vendor, today=None):
     metrics = {'yesterday': 1, 'last7': 7, 'sales_30': 30}
     empty = {key: 0 if coverage[n] == n else None for key, n in metrics.items()}
     by_option = {}
-    for oid, day, quantity in conn.execute('''SELECT option_id,paid_date,SUM(quantity)
-        FROM rg_order_items WHERE vendor_id=? AND paid_date BETWEEN ? AND ?
-        GROUP BY option_id,paid_date''', (vendor, starts[30], last)):
+    for (day, oid), group in read_models.daily_api_totals(conn, vendor, starts[30], last).items():
         totals = by_option.setdefault(oid, dict(empty))
         for key, n in metrics.items():
             if totals[key] is not None and day >= starts[n]:
-                totals[key] += quantity
+                totals[key] += group['quantity']
     return dict(by_option=by_option, coverage=coverage, empty=empty)
 
 
@@ -135,24 +135,8 @@ def normalize_order(order, vendor, first, last):
 
 
 def _request_sales(api, path, params=None, progress=None):
-    """RG sometimes reports rate limiting as HTTP 200 with code 500 in JSON."""
-    for attempt in range(3):
-        api.check_cancelled()
-        response = api._request('GET', path, params)
-        if not isinstance(response, dict):
-            return response
-        code = str(response.get('code', '')).upper()
-        message = str(response.get('message') or '').lower()
-        transient = code in ('429', '500', '502', '503', '504')
-        if not transient or attempt == 2:
-            return response
-        delay = 30 * (attempt + 1)
-        callback = progress or getattr(api, 'progress', None)
-        if callback:
-            reason = '쿠팡 호출 제한' if code == '429' or '429' in message or 'too many requests' in message else '쿠팡 일시 오류'
-            callback(f'{reason} · {delay}초 후 재시도 {attempt+1}/2')
-        api.wait(delay)
-    return response
+    """Use the same bounded request policy as inventory and catalog queries."""
+    return api_query.request_json(api, 'GET', path, params, progress=progress)
 
 
 def fetch_order_detail(api, order_id, first, last, progress=None):
@@ -248,60 +232,70 @@ def prefer_external_sale(conn, paid_date, model, method, option_id=''):
                  [paid_date, SOURCE_PREFIX + '%', *args])
 
 
+def _sale_inputs(conn, vendor, start=None, end=None, option_ids=None):
+    """Common projection and precedence rules for rebuilding and status reads."""
+    grouped = read_models.daily_api_totals(conn, vendor, start, end, option_ids)
+    catalog = read_models.catalog_snapshot(conn)
+    mappings = {oid: model for oid, model in catalog['model_map'].items() if model}
+    external_options, external_models = set(), set()
+    source = SOURCE_PREFIX + vendor
+    for row in conn.execute("SELECT sale_date,option_id,model FROM sales WHERE method='로켓그로스' AND COALESCE(source,'')<>?", (source,)):
+        oid = str(row['option_id'] or '')
+        external_options.add((row['sale_date'], oid))
+        if not oid:
+            external_models.add((row['sale_date'], str(row['model'] or '')))
+    pending = {(row['sale_date'], row['option_id']) for row in conn.execute(
+        "SELECT sale_date,option_id FROM sales_pending WHERE method='로켓그로스'")}
+    return grouped, catalog['products'], mappings, external_options | pending, external_models
+
+
+def _sale_identity(paid, oid, products, mappings, conflicts, external_models):
+    product = products.get(oid, {})
+    model = str(mappings.get(oid) or product.get('model') or '').strip()
+    conflict = (paid, oid) in conflicts or bool(model and (paid, model) in external_models)
+    return product, model, conflict
+
+
+def sales_status(conn, vendor, start=None, end=None, option_ids=None):
+    """Count current conflicts/unmapped API totals without writing sales or mappings."""
+    grouped, products, mappings, conflicts, external_models = _sale_inputs(
+        conn, vendor, start, end, option_ids)
+    result = dict(conflicts=0, unmapped=0)
+    for paid, oid in grouped:
+        _, model, conflict = _sale_identity(paid, oid, products, mappings, conflicts, external_models)
+        if conflict:
+            result['conflicts'] += 1
+        elif not model:
+            result['unmapped'] += 1
+    return result
+
+
 def rebuild_sales(conn, vendor, start=None, end=None, option_ids=None):
     """Rebuild owned daily totals only. Caller owns the transaction."""
     source = SOURCE_PREFIX + vendor
-    where, params = 'vendor_id=?', [vendor]
     sale_where, sale_params = 'source=?', [source]
     if start is not None and end is not None:
-        where += ' AND paid_date BETWEEN ? AND ?'
-        params += [start, end]
         sale_where += ' AND sale_date BETWEEN ? AND ?'
         sale_params += [start, end]
     if option_ids is not None:
         if not option_ids:
             return dict(inserted=0, updated=0, unchanged=0, conflicts=0, unmapped=0)
         marks = ','.join('?' for _ in option_ids)
-        where += f' AND option_id IN ({marks})'
         sale_where += f' AND option_id IN ({marks})'
-        params += list(option_ids)
         sale_params += list(option_ids)
-    # Stream only the fields needed for aggregation; raw history can grow large.
-    raw = conn.execute('SELECT paid_date,option_id,quantity,revenue,product_name FROM rg_order_items WHERE ' + where, params)
+    grouped, products, mappings, conflicts, external_models = _sale_inputs(
+        conn, vendor, start, end, option_ids)
     current = conn.execute('SELECT * FROM sales WHERE ' + sale_where, sale_params).fetchall()
-    grouped, owned = {}, {}
-    for row in raw:
-        key = (row['paid_date'], row['option_id'])
-        group = grouped.get(key)
-        if group is None:
-            group = grouped[key] = dict(quantity=0, revenue=Decimal(0), orders=0, product=row['product_name'])
-        group['quantity'] += row['quantity']
-        group['revenue'] += Decimal(row['revenue'])
-        # The (vendor, order, option) primary key permits one row per order here.
-        group['orders'] += 1
+    owned = {}
     for row in current:
         owned.setdefault((row['sale_date'], row['option_id']), []).append(row)
-    mappings = {r['option_id']: r['model'] for r in conn.execute('SELECT option_id,model FROM option_model_map') if r['model']}
-    products = {}
-    for r in conn.execute("SELECT * FROM products WHERE fulfillment_type='로켓그로스' ORDER BY updated_at DESC,id DESC"):
-        products.setdefault(str(r['option_id'] or ''), dict(r))
-    # Index externally maintained totals once, not one SQL scan for every option.
-    external_options, external_models = set(), set()
-    for r in conn.execute("SELECT sale_date,option_id,model FROM sales WHERE method='로켓그로스' AND COALESCE(source,'')<>?", (source,)):
-        oid = str(r['option_id'] or '')
-        external_options.add((r['sale_date'], oid))
-        if not oid:
-            external_models.add((r['sale_date'], str(r['model'] or '')))
-    pending = {(r['sale_date'], r['option_id']) for r in conn.execute("SELECT sale_date,option_id FROM sales_pending WHERE method='로켓그로스'")}
     result = dict(inserted=0, updated=0, unchanged=0, conflicts=0, unmapped=0)
     unmatched, matched = {}, set()
     for key in sorted(set(grouped) | set(owned)):
         paid, oid = key
         rows = owned.get(key, [])
         group = grouped.get(key)
-        product = products.get(oid, {})
-        model = str(mappings.get(oid) or product.get('model') or '').strip()
-        conflict = key in pending or key in external_options or bool(model and (paid, model) in external_models)
+        product, model, conflict = _sale_identity(paid, oid, products, mappings, conflicts, external_models)
         if group is None or conflict:
             if rows:
                 conn.executemany('DELETE FROM sales WHERE id=?', [(r['id'],) for r in rows])

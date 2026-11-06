@@ -3,6 +3,7 @@
 import math
 import html
 import re
+import read_models
 
 
 def parse_coupang_size(value):
@@ -28,18 +29,21 @@ def normalize_size(value):
 
 
 def load_context(db):
-    """Five SELECTs, independent of the number of products; never save inferred data."""
-    model_map = {str(r['option_id'] or '').strip(): str(r['model'] or '').strip()
-                 for r in db.query('SELECT option_id,model FROM option_model_map')}
-    profiles = {str(r['model'] or '').strip(): dict(r)
-                for r in db.query('SELECT * FROM gross_margin_profiles')}
-    refs = {}
-    for row in db.query("SELECT * FROM margin_refs WHERE method='로켓그로스' ORDER BY id"):
-        refs.setdefault(str(row['model'] or '').strip(), dict(row))
-    rates = [dict(r) for r in db.query('SELECT * FROM fulfillment_rates ORDER BY min_price DESC,id')]
-    commission = number(db.setting('commission_rate', '7.8'))
-    return dict(model_map=model_map, profiles=profiles, refs=refs, rates=rates,
-                commission=7.8 if commission is None else commission, sizes={})
+    """Reuse saved pricing inputs until SQLite changes; inferred sizes are batch-local."""
+    def load():
+        model_map = {oid.strip(): str(model or '').strip()
+                     for oid, model in read_models.option_models(db.conn).items()}
+        profiles = {str(r['model'] or '').strip(): dict(r)
+                    for r in db.query('SELECT * FROM gross_margin_profiles')}
+        refs = {}
+        for row in db.query("SELECT * FROM margin_refs WHERE method='로켓그로스' ORDER BY id"):
+            refs.setdefault(str(row['model'] or '').strip(), dict(row))
+        rates = [dict(r) for r in db.query('SELECT * FROM fulfillment_rates ORDER BY min_price DESC,id')]
+        commission = number(db.setting('commission_rate', '7.8'))
+        return dict(model_map=model_map, profiles=profiles, refs=refs, rates=rates,
+                    commission=7.8 if commission is None else commission)
+    context = read_models.cached_read(db.conn, 'gross_margin_context', load)
+    return dict(context, sizes={})
 
 
 def _matches(rate, sale):

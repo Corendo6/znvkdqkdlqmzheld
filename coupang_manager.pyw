@@ -25,14 +25,16 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import api_query
 import rocket_inventory
 import rocket_sales
 import gross_margin
+import read_models
 import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.19"
+VERSION = "0.4.20"
 
 
 def resource_path(*parts):
@@ -214,6 +216,7 @@ class CoupangAPI:
         self.cancel_event = None
         self.progress = None
         self.phase = ''
+        self._query_cache = api_query.QueryCache()
         if not self.vendor_id or not self.access_key or not self.secret_key:
             raise CoupangAPIError("Vendor ID, Access Key, Secret Key를 모두 입력하세요.")
 
@@ -240,70 +243,60 @@ class CoupangAPI:
         self.check_cancelled()
 
     def _request(self, method, path, params=None, timeout=15):
+        return api_query.request_json(self, method, path, params, timeout=timeout)
+
+    def _request_once(self, method, path, params=None, timeout=15, attempt=1, max_attempts=1):
+        """One signed wire attempt; api_query owns the whole retry budget."""
         timeout = min(timeout, 15)
-        params = params or []
-        if isinstance(params, dict):
-            params = list(params.items())
-        query = urllib.parse.urlencode(params, doseq=True)
+        pairs = list(params.items()) if isinstance(params, dict) else (params or [])
+        query = urllib.parse.urlencode(pairs, doseq=True)
         url = self.HOST + path + (("?" + query) if query else "")
         LOGGER.debug("API request %s %s%s", method.upper(), path, (("?" + query) if query else ""))
-        last_error = None
-        for attempt in range(2):
-            self.check_cancelled()
-            if '/rg/inventory/' in path or path.endswith('/rg/orders') or '/rg/order/' in path:
-                # Include retry attempts and subsequent refreshes in the 50/min limit.
-                with CoupangAPI._rg_rate_lock:
-                    self.wait(max(0, CoupangAPI._rg_next_at - time.monotonic()))
-                    CoupangAPI._rg_next_at = time.monotonic() + 1.3
-            auth = self._authorization(method, path, query)
-            req = urllib.request.Request(url, method=method.upper())
-            req.add_header("Content-Type", "application/json;charset=UTF-8")
-            req.add_header("Authorization", auth)
-            if self.progress:
-                self.progress(f'{self.phase} · 응답 대기 {attempt+1}/2 (네트워크 대기 제한 {timeout}초)')
-            self.check_cancelled()
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    body = resp.read().decode("utf-8", errors="replace")
-                    self.check_cancelled()
-                    return json.loads(body) if body else {}
-            except CoupangAPICancelled:
-                raise
-            except urllib.error.HTTPError as e:
+        self.check_cancelled()
+        if api_query.is_rocket_growth(path):
+            # Pacing applies to every physical attempt, including retries.
+            with CoupangAPI._rg_rate_lock:
+                self.wait(max(0, CoupangAPI._rg_next_at - time.monotonic()))
+                CoupangAPI._rg_next_at = time.monotonic() + 1.3
+        auth = self._authorization(method, path, query)
+        req = urllib.request.Request(url, method=method.upper())
+        req.add_header("Content-Type", "application/json;charset=UTF-8")
+        req.add_header("Authorization", auth)
+        if self.progress:
+            self.progress(f'{self.phase} · 응답 대기 {attempt}/{max_attempts} (네트워크 대기 제한 {timeout}초)')
+        self.check_cancelled()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                self.check_cancelled()
+                return json.loads(body) if body else {}
+        except CoupangAPICancelled:
+            raise
+        except urllib.error.HTTPError as e:
+            with e:
                 body = e.read().decode("utf-8", errors="replace")
-                self.check_cancelled()
-                hint = {401:'API 키와 PC 시간을 확인하세요.', 403:'API 권한과 WING의 허용 IP를 확인하세요.',
-                        429:'호출 제한에 걸렸습니다. 잠시 후 다시 실행하세요.'}.get(e.code, '')
-                last_error = CoupangAPIError(f"HTTP {e.code}: {hint} {body or e.reason}",
-                                            stop_sync=e.code in (401,403,429,500,502,503,504))
-                LOGGER.error("API HTTP error %s %s: %s", method.upper(), path, last_error)
-                # 쿠팡 상품 상세조회는 간헐적으로 HTTP 400 + DEFAULT/generic message를
-                # 반환한 뒤 동일 요청이 잠시 후 성공하는 경우가 실제 로그에서 확인됐다.
-                # 명백한 파라미터 오류까지 무작정 재시도하지 않고, 이 generic DEFAULT만
-                # 일시 오류로 간주하여 재서명 후 backoff 재시도한다.
-                transient_400 = (
-                    e.code == 400
-                    and '"code":"DEFAULT"' in body.replace(' ', '')
-                    and '자세한 사항은 로그를 확인해주세요' in body
-                )
-                retryable = e.code in (429, 500, 502, 503, 504) or transient_400
-                if not retryable or attempt >= 1:
-                    raise last_error
-                delay = (1.8, 4.0, 7.0)[attempt]
-                LOGGER.warning("API transient error retry %s/2 after %.1fs path=%s", attempt + 1, delay, path)
-                self.wait(delay)
-            except (urllib.error.URLError, TimeoutError) as e:
-                self.check_cancelled()
-                reason = getattr(e, 'reason', e)
-                last_error = CoupangAPIError(f"네트워크 응답 지연 또는 연결 오류 ({timeout}초 제한): {reason}", stop_sync=True)
-                LOGGER.error("API network error %s %s: %s", method.upper(), path, last_error)
-                if attempt >= 1:
-                    raise last_error
-                self.wait(1.0 * (attempt + 1))
-            except Exception as e:
-                LOGGER.exception("API unexpected error %s %s", method.upper(), path)
-                raise CoupangAPIError(str(e)) from e
-        raise last_error or CoupangAPIError("API 요청에 실패했습니다.")
+            self.check_cancelled()
+            hint = {401:'API 키와 PC 시간을 확인하세요.', 403:'API 권한과 WING의 허용 IP를 확인하세요.',
+                    429:'호출 제한에 걸렸습니다. 잠시 후 다시 실행하세요.'}.get(e.code, '')
+            error = CoupangAPIError(f"HTTP {e.code}: {hint} {body or e.reason}",
+                                    stop_sync=e.code in (401,403,429,500,502,503,504))
+            LOGGER.error("API HTTP error %s %s: %s", method.upper(), path, error)
+            # Only the observed generic DEFAULT 400 is transient, never a
+            # malformed-parameter 400. A fresh signature is made on each try.
+            transient_400 = (e.code == 400
+                and '"code":"DEFAULT"' in body.replace(' ', '')
+                and '자세한 사항은 로그를 확인해주세요' in body)
+            raise api_query.TransportFailure(error,
+                retryable=str(e.code) in api_query.TRANSIENT_CODES or transient_400) from None
+        except (urllib.error.URLError, TimeoutError) as e:
+            self.check_cancelled()
+            reason = getattr(e, 'reason', e)
+            error = CoupangAPIError(f"네트워크 응답 지연 또는 연결 오류 ({timeout}초 제한): {reason}", stop_sync=True)
+            LOGGER.error("API network error %s %s: %s", method.upper(), path, error)
+            raise api_query.TransportFailure(error, retryable=True, network=True) from None
+        except Exception as e:
+            LOGGER.exception("API unexpected error %s %s", method.upper(), path)
+            raise CoupangAPIError(str(e)) from e
 
     def test_connection(self):
         return self._request("GET", self.PRODUCT_LIST_PATH, [
@@ -377,12 +370,13 @@ class CoupangAPI:
         if not targets:
             return {'latest':{}, 'history':{}, 'daysScanned':0, 'requests':0}
 
-        today=date.today()
+        today=self._query_cache.day
         end=today-timedelta(days=1)  # API permits through yesterday only.
         floor=end-timedelta(days=max(1, int(lookback_days))-1)
         unresolved=set(targets)
         history={}  # vendorItemId -> productId -> most recent recognitionDate
         request_count=0
+        cache_hits=0
         scanned_days=0
 
         while end >= floor and unresolved:
@@ -390,6 +384,8 @@ class CoupangAPI:
             token=''
             chunk_seen=set()
             page=0
+            seen_tokens=set()
+            completed_pages={}
             while True:
                 params=[
                     ('vendorId', self.vendor_id),
@@ -398,12 +394,27 @@ class CoupangAPI:
                     ('token', token),
                     ('maxPerPage', 50),
                 ]
-                result=self._request('GET', self.REVENUE_PATH, params, timeout=45)
-                request_count += 1
+                self.check_cancelled()
+                cache_key=self._query_cache.key(self.vendor_id, 'GET', self.REVENUE_PATH, params)
+                result=self._query_cache.get(cache_key)
+                if result is None:
+                    result=self._request('GET', self.REVENUE_PATH, params, timeout=45)
+                    request_count += 1
+                else:
+                    cache_hits += 1
                 page += 1
-                code=str(result.get('code',''))
+                if not isinstance(result, dict):
+                    raise CoupangAPIError('매출내역 응답 형식이 올바르지 않습니다.')
+                code=str(result.get('code','')).upper()
                 if code not in ('200','SUCCESS',''):
                     raise CoupangAPIError(result.get('message') or '매출내역 조회 실패')
+                rows=result.get('data')
+                if not isinstance(rows, list) or any(not isinstance(sale, dict)
+                        or not isinstance(sale.get('items', []), list)
+                        or any(not isinstance(item, dict) for item in sale.get('items', []))
+                        for sale in rows):
+                    raise CoupangAPIError('매출내역 상품 목록의 응답 형식이 올바르지 않습니다.')
+                completed_pages[cache_key]=result
                 for sale in result.get('data') or []:
                     # productId reflects the ordered item; use payment/sale date for
                     # recency so a later refund recognition does not make an old mapping look current.
@@ -422,9 +433,14 @@ class CoupangAPI:
                     progress(f'노출ID 확인 {start:%Y-%m-%d}~{end:%Y-%m-%d} {page}페이지 / 발견 {found_count}/{len(targets)}')
                 has_next=bool(result.get('hasNext'))
                 next_token=str(result.get('nextToken') or '')
-                if not has_next or not next_token:
+                if not has_next:
                     break
+                if not next_token or next_token in seen_tokens:
+                    raise CoupangAPIError('매출내역의 다음 페이지가 누락되거나 반복됩니다.')
+                seen_tokens.add(next_token)
                 token=next_token
+            self.check_cancelled()
+            self._query_cache.publish(completed_pages)
             # We scan newest to oldest. Once an option appears in this entire
             # date chunk, older chunks cannot provide a more current mapping.
             unresolved -= chunk_seen
@@ -444,6 +460,7 @@ class CoupangAPI:
             'history':history,
             'daysScanned':scanned_days,
             'requests':request_count,
+            'cacheHits':cache_hits,
             'unresolved':sorted(unresolved),
         }
 
@@ -878,6 +895,7 @@ class Database:
         self.conn.commit()
 
     def close(self):
+        read_models.clear(self.conn)
         self.conn.close()
 
     def backup_to(self, target):
@@ -2943,11 +2961,7 @@ class CoupangManager(tk.Tk):
     # ---------------- Gross margin ----------------
     @staticmethod
     def _normalize_gross_size(value):
-        raw=str(value or '').strip().replace(' ','')
-        return {
-            '극소형':'극소형','소형':'소형','중형':'중형',
-            '대형1':'대형 1','대형2':'대형 2','특대형':'특대형',
-        }.get(raw,'')
+        return gross_margin.normalize_size(value)
 
     def _gross_rate_for(self, size_type, sale_price):
         size=self._normalize_gross_size(size_type)
@@ -3989,9 +4003,8 @@ class CoupangManager(tk.Tk):
                             linked=rocket_sales.rebuild_sales(db2.conn,vendor)
                         if results.get('orders',{}).get('ok'):
                             saved['updated']+=linked['updated']
-                            # Recount the selected window after newly imported model links.
-                            with db2.conn:
-                                selected=rocket_sales.rebuild_sales(db2.conn,vendor,sales_from,sales_to)
+                            # Reporting must not rebuild or write the same daily rows again.
+                            selected=rocket_sales.sales_status(db2.conn,vendor,sales_from,sales_to)
                             saved['unmapped']=selected['unmapped']
                             saved['conflicts']=selected['conflicts']
                             results['orders']['text']=rocket_sales.summary(saved)
@@ -4743,41 +4756,8 @@ class CoupangManager(tk.Tk):
             # 상세조회 burst를 조금 완화해 쿠팡 게이트웨이의 간헐적 DEFAULT 400을 줄인다.
             api.wait(0.08)
 
-        # 첫 패스에서 끝까지 실패한 상품은 전체 순회가 끝난 뒤 한 번 더 시도한다.
-        # 같은 sellerProductId가 이전 동기화에서는 성공하고 다음 동기화에서 400이
-        # 발생한 로그가 있어, 고정 불량 상품보다 일시적인 게이트웨이 오류 가능성이 크다.
-        if failed_products:
-            self.api_queue.put(('status',f'상세조회 실패 {len(failed_products)}건 재확인 중...'))
-            LOGGER.info("상세조회 2차 재시도 시작 count=%s", len(failed_products))
-            retry_failed=[]; retry_errors=[]
-            api.wait(2.0)
-            for idx,entry in enumerate(failed_products,1):
-                p=entry.get('product') or {}
-                sid=p.get('sellerProductId')
-                try:
-                    detail=api.get_product(sid)
-                    list_pids=[str(x) for x in (p.get('_listProductIds') or []) if str(x).strip()]
-                    detail['_listProductId'] = list_pids[0] if list_pids else str(p.get('productId') or '')
-                    detail['_listProductIds'] = list_pids
-                    detail['_listItems'] = p.get('items') or []
-                    details.append(detail)
-                    LOGGER.info("상세조회 2차 재시도 성공 sellerProductId=%s", sid)
-                except Exception as e:
-                    if getattr(e, 'stop_sync', False):
-                        raise
-                    sources=','.join(p.get('_sources') or [])
-                    name=p.get('sellerProductName') or ''
-                    status=p.get('statusName') or p.get('status') or ''
-                    retry_failed.append({'product':p,'error':str(e)})
-                    retry_errors.append(f'{sid}: {e} / name={name} / status={status} / sources={sources}')
-                    LOGGER.warning("상세조회 2차 재시도 실패 sellerProductId=%s name=%s", sid, name)
-                if idx % 5 == 0:
-                    self.api_queue.put(('status',f'실패 상품 재확인 {idx}/{len(failed_products)}...'))
-                api.wait(0.25)
-            failed_products=retry_failed
-            errors=retry_errors
-            LOGGER.info("상세조회 2차 재시도 완료 최종실패=%s", len(failed_products))
-
+        # Retry limits and backoff live in the common request layer. A failed
+        # detail keeps the existing product through the list fallback below.
         api.check_cancelled()
         ins,upd,fallback_option_ids=self._merge_api_products(db2,details)
         fb_ins,fb_upd=self._merge_failed_list_products(db2,failed_products)

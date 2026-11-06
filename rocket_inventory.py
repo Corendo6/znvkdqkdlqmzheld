@@ -5,8 +5,10 @@ The inventory API supplies stock; daily order API quantities supply all sales wi
 Missing observations remain unknown; inbound quantities are explicitly manual.
 """
 import csv
+import api_query
 import gross_margin
 import product_search
+import read_models
 import rocket_sales
 import hashlib
 import io
@@ -83,7 +85,7 @@ def fetch_inventory(api, progress=None, vendor_item_id=None):
             params.append(('vendorItemId', str(vendor_item_id)))
         elif token is not None:
             params.append(('nextToken', token))
-        result = api._request('GET', path, params)
+        result = api_query.request_json(api, 'GET', path, params, progress=progress)
         if not isinstance(result, dict) or str(result.get('code', '')).upper() not in ('200', 'SUCCESS'):
             raise ValueError((result.get('message') if isinstance(result, dict) else '') or '재고 API 조회에 실패했습니다.')
         rows = result.get('data')
@@ -176,6 +178,16 @@ def inventory_state(stock, sales_30, fetched_at, present=True, lead=5, safety=3,
     return ('품절 임박' if days <= lead + safety else '양호'), days, True
 
 
+def decision_metrics(stock, sales_30, pending, fetched_at, present=True,
+                     lead=5, target=14, safety=3, pack=1, last7=None, now=None):
+    """One set of decision values for both views and exports; unknown stays unknown."""
+    state, days, usable = inventory_state(stock, sales_30, fetched_at, present, lead, safety, now)
+    recommended = replenishment(stock, sales_30, pending, lead, target, safety, pack) if usable else None
+    gap7 = (last7 * 2.5 - stock - pending
+            if usable and all(value is not None for value in (last7, stock, pending)) else None)
+    return dict(state=state, days=days, usable=usable, recommended=recommended, gap7=gap7)
+
+
 def product_image_url(item):
     images = [x for x in (item.get('images') or []) if isinstance(x, dict)]
     images.sort(key=lambda x: (x.get('imageType') != 'REPRESENTATION', str(x.get('imageOrder', '0'))))
@@ -211,7 +223,7 @@ def build_rows(app, now=None):
     snapshots = {r['option_id']: dict(r) for r in app.db.query(
         'SELECT * FROM rg_inventory_snapshots WHERE vendor_id=? AND in_latest_response=1', (vendor,))}
     products = {}
-    for row in app.db.query("SELECT * FROM products WHERE fulfillment_type='로켓그로스' ORDER BY updated_at DESC,id DESC"):
+    for row in read_models.catalog_snapshot(app.db.conn)['products'].values():
         p = dict(row)
         oid = str(p.get('option_id') or '').strip()
         if oid in snapshots and oid not in products:
@@ -235,15 +247,14 @@ def build_rows(app, now=None):
         stock, sales = snap.get('orderable_quantity'), history['sales_30']
         if stock == 0 and sales == 0 and not manual.get('pending_quantity'):
             continue
-        state, days, usable = inventory_state(stock, sales, snap.get('fetched_at'),
-                                              bool(snap.get('in_latest_response')), lead, safety, now)
         quantity = manual.get('pending_quantity')
         pack = manual.get('pack_quantity', 1)
-        recommended = replenishment(stock, sales, quantity, lead, target, safety, pack) if usable else None
+        metrics = decision_metrics(stock, sales, quantity, snap.get('fetched_at'),
+                                   bool(snap.get('in_latest_response')), lead, target, safety,
+                                   pack, history['last7'], now)
         rows.append(dict(p, key=key, vendor_id=vendor, stock=stock, sales_30=sales,
                          pending=quantity, pack=pack, pending_note=manual.get('note', ''),
-                         pending_updated=manual.get('updated_at'), recommended=recommended,
-                         state=state, days=days, usable=usable, checked_at=snap.get('fetched_at'),
+                         pending_updated=manual.get('updated_at'), **metrics, checked_at=snap.get('fetched_at'),
                          external_sku_id=snap.get('external_sku_id', ''),
                          yesterday=history['yesterday'], last7=history['last7'],
                          recorded_days=daily['coverage'][7], sales_recorded_days=daily['coverage'][30],
@@ -565,9 +576,6 @@ class RocketInventoryPage(tk.Frame):
             values=[]
             for key,_,_ in self.sheet_columns:
                 value=row.get(key)
-                if key=='gap7':
-                    value = (row['last7']*2.5-row['stock']-row['pending']
-                             if row.get('usable') and all(row.get(k) is not None for k in ('last7','stock','pending')) else None)
                 if key=='sale_price': value=row['gross']['sale']
                 if key=='state' and urgent_stock(row): value='긴급 · '+value
                 values.append('—' if value is None else f'{value:.1f}' if key in ('days','margin_rate') else f'{value:+,.1f}' if key=='gap7' else format_number(value) if isinstance(value,(int,float)) else value)
@@ -1157,7 +1165,8 @@ class RocketInventoryPage(tk.Frame):
         columns = [('model', '모델명'), ('product_name', '상품명'), ('option_name', '옵션명'), ('option_id', '옵션ID'),
                    ('stock', '주문가능재고'), ('pending', '입고중_직접입력'), ('recommended', '권장추가입고_자체계산'),
                    ('pack', '입고단위'), ('sales_30', '30일판매수량_일일매출API'), ('yesterday', '어제판매수량_일일매출API'),
-                   ('last7', '7일판매수량_일일매출API'), ('recorded_days', '7일중조회완료일수'),
+                   ('last7', '7일판매수량_일일매출API'), ('gap7', '부족분_7일판매x2.5_재고입고중차감'),
+                   ('recorded_days', '7일중조회완료일수'),
                    ('sales_recorded_days', '30일중조회완료일수'), ('days', '소진예상일수'),
                    ('sale_price', '판매가_저장값'), ('coupon_price', '쿠폰가_저장값'), ('estimated_cost', '예상개당비용_자체계산'),
                    ('unit_cost', '원가'), ('logistics', '물류비_VAT포함'),
