@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Rocket Growth inventory, replenishment estimates, and WING-like desktop page.
 
-The inventory API supplies stock; daily order API quantities supply all sales windows.
+The inventory API supplies stock and 30-day sales; recent orders remain provisional.
 Missing observations remain unknown; inbound quantities are explicitly manual.
 """
 import csv
@@ -244,7 +244,9 @@ def build_rows(app, now=None):
         oid = str(p.get('option_id') or '').strip()
         snap, manual = snapshots.get(oid, {}), pending.get(oid, {})
         history = daily['by_option'].get(oid, daily['empty'])
-        stock, sales = snap.get('orderable_quantity'), history['sales_30']
+        # Use Coupang's inventory summary unchanged, not a different order-ledger
+        # aggregate. Missing direct observations must not look like official 0s.
+        stock, sales = snap.get('orderable_quantity'), snap.get('sales_30')
         if stock == 0 and sales == 0 and not manual.get('pending_quantity'):
             continue
         quantity = manual.get('pending_quantity')
@@ -257,6 +259,9 @@ def build_rows(app, now=None):
                          pending_updated=manual.get('updated_at'), **metrics, checked_at=snap.get('fetched_at'),
                          external_sku_id=snap.get('external_sku_id', ''),
                          yesterday=history['yesterday'], last7=history['last7'],
+                         order_yesterday=history['yesterday'], order_last7=history['last7'],
+                         order_sales_30=history['sales_30'],
+                         sales_30_source='쿠팡 재고 API', recent_sales_source='출고 주문 · 잠정',
                          recorded_days=daily['coverage'][7], sales_recorded_days=daily['coverage'][30],
                          gross=gross, estimated_cost=gross['estimated_cost'],
                          unit_cost=gross['cost'], logistics=gross['logistics'],
@@ -388,7 +393,7 @@ class ThumbnailCache:
 
 
 class RocketInventoryPage(tk.Frame):
-    WIDTHS = (34, 260, 108, 144, 138, 130, 110)
+    WIDTHS = (34, 260, 144, 144, 138, 130, 110)
     ROW_HEIGHT = 132
 
     def __init__(self, parent, app):
@@ -473,7 +478,7 @@ class RocketInventoryPage(tk.Frame):
         cb.bind('<<ComboboxSelected>>', lambda e: self.apply_filters())
         self.button(toolbar, 'CSV 저장', self.export_csv).pack(side='right')
         self.button(toolbar, '선택 입고중 입력', self.edit_selected).pack(side='right', padx=8)
-        self.label(self, '최근 재고 응답 상품  ·  현재 판매가 기준 마진 · 클릭: 비용 상세  ·  F5: 모델명 / 상품명 / 옵션 ID 검색', color=MUTED, size=9, anchor='w').pack(fill='x', pady=(0, 6))
+        self.label(self, '30일: 쿠팡 제공 판매량  ·  어제·7일: 출고 주문 기준 잠정 수량  ·  F5: 상품 / 옵션 ID 검색', color=MUTED, size=9, anchor='w').pack(fill='x', pady=(0, 6))
         holder = tk.Frame(self, bg=BG, highlightthickness=1, highlightbackground=BORDER)
         self.holder = holder
         holder.grid_columnconfigure(0, weight=1)
@@ -518,8 +523,8 @@ class RocketInventoryPage(tk.Frame):
         holder.pack(fill='both', expand=True)
         self.sheet_frame = ttk.Frame(holder)
         self.sheet_columns = [('model','모델',120),('product_name','상품명',260),('option_name','옵션',170),
-            ('option_id','옵션 ID',120),('yesterday','어제 판매',85),('last7','7일 판매',85),
-            ('sales_30','30일 판매',85),('stock','판매가능',85),('pending','입고중',85),
+            ('option_id','옵션 ID',120),('yesterday','어제(잠정)',105),('last7','7일(잠정)',105),
+            ('sales_30','30일(쿠팡)',110),('stock','판매가능',85),('pending','입고중',85),
             ('recommended','권장입고',85),('days','소진 예상(일)',100),('state','재고 상태',110),
             ('sale_price','판매가',100),('unit_cost','원가',90),('margin','개당 마진',100),('margin_rate','마진율(%)',95),('gap7','7일×2.5 부족분',125)]
         self.sheet = ttk.Treeview(self.sheet_frame, columns=[k for k,_,_ in self.sheet_columns], show='headings', selectmode='extended')
@@ -535,7 +540,7 @@ class RocketInventoryPage(tk.Frame):
         self.sheet.tag_configure('even',background='#ffffff',foreground=INK)
         self.sheet.tag_configure('odd',background='#f0f4f8',foreground=INK)
         self.sheet.tag_configure('urgent',foreground='#8b2525',background='#fff0ed')
-        ttk.Label(self.sheet_frame, text='7일×2.5 부족분 = 최근 7일 판매 × 2.5 − 판매가능 − 입고중  |  양수: 부족 / 음수: 여유 / —: 미확인').grid(row=2,column=0,sticky='w',pady=5)
+        ttk.Label(self.sheet_frame, text='7일×2.5 부족분 = 7일 출고 주문(잠정) × 2.5 − 판매가능 − 입고중  |  양수: 부족 / 음수: 여유 / —: 미확인').grid(row=2,column=0,sticky='w',pady=5)
         sv=ttk.Scrollbar(self.sheet_frame,orient='vertical',command=self.sheet.yview)
         sh=ttk.Scrollbar(self.sheet_frame,orient='horizontal',command=self.sheet.xview)
         self.sheet.configure(yscrollcommand=sv.set,xscrollcommand=sh.set)
@@ -648,12 +653,12 @@ class RocketInventoryPage(tk.Frame):
         vendor = self.app.db.setting('api_vendor_id', '').strip()
         stamp = self.app.db.setting('rg_last_sync:' + vendor, '')
         error = self.app.db.setting('rg_last_error:' + vendor, '')
-        status = '마지막 재고 조회: ' + (stamp.replace('T', ' ')[:19] + ' (한국시간)' if stamp else '아직 조회하지 않았습니다')
+        status = '재고·30일 판매량 조회: ' + (stamp.replace('T', ' ')[:19] + ' (한국시간)' if stamp else '아직 조회하지 않았습니다')
         if error:
             status += '  ·  최근 조회 실패 — 이전 결과 표시 중'
         sales_stamp = self.app.db.setting('rg_orders_last_sync:' + vendor, '')
         sales_error = self.app.db.setting('rg_orders_last_error:' + vendor, '')
-        status += '\n마지막 일일 매출 조회: ' + (sales_stamp.replace('T', ' ')[:19] + ' (한국시간)' if sales_stamp else '조회 전 · 데이터·설정에서 최근 30일 조회')
+        status += '\n어제·7일 출고 주문 조회: ' + (sales_stamp.replace('T', ' ')[:19] + ' (한국시간)' if sales_stamp else '조회 전 · 데이터·설정에서 최근 30일 조회')
         if sales_error:
             status += '  ·  최근 매출 조회 실패 — 이전 결과 표시 중'
         self.set_status(status)
@@ -849,7 +854,7 @@ class RocketInventoryPage(tk.Frame):
         metric(2, 20, '어제', format_number(r['yesterday']))
         metric(2, 48, '7일', format_number(r['last7']))
         metric(2, 76, '30일', format_number(r['sales_30']), True)
-        self._text(c, edges[2]+10, y+107, f'일일매출 {r["sales_recorded_days"]}/30일 조회', color=MUTED, size=8)
+        self._text(c, edges[2]+10, y+99, '어제·7일: 출고 잠정\n30일: 쿠팡 제공', color=MUTED, size=8)
         metric(3, 20, '판매가능', format_number(r['stock']), True, color=RED if urgent_stock(r) else None)
         text = '소진 예상 —' if r['days'] is None else f'소진 예상 {r["days"]:.1f}일'
         self._text(c, edges[3]+10, y+45, text, color=RED if urgent_stock(r) else MUTED, size=8)
@@ -1133,14 +1138,16 @@ class RocketInventoryPage(tk.Frame):
             '  재고·최근 30일 판매가 모두 0이고 입력된 입고중 물량도 없으면 제외합니다.\n'
             '  최근 판매가 있는 품절 상품과 미확인 수량은 그대로 표시합니다.\n'
             '• 판매가능: 로켓그로스 재고 API 응답입니다.\n'
-            '• 어제 / 7일 / 30일: 일일 매출 API로 수집한 옵션별 판매수량을 합산합니다.\n'
-            '  모두 한국시간 어제까지이며, 주문 건수나 매출액이 아닌 판매 개수입니다.\n'
+            '• 30일: 재고 API가 직접 제공한 최근 30일 판매수량입니다.\n'
+            '  값이 없으면 —이며 주문 합계로 대체하지 않습니다. 쿠팡 화면과 조회 시각이 다를 수 있습니다.\n'
+            '• 어제 / 7일: 출고 주문의 결제일 기준 잠정 수량이며 쿠팡 화면과 다를 수 있습니다.\n'
+            '  한국시간 어제까지이며, 주문 건수나 매출액이 아닌 판매 개수입니다.\n'
             '  기간 전체를 조회했으면 판매 없는 날은 0개, 미조회 날짜가 있으면 —입니다.\n'
             '  데이터·설정 > API 갱신에서 최근 30일 매출을 조회하세요.\n'
-            '  출고된 주문의 결제일 기준 잠정 수량입니다. 재조회 시 늦은 출고분을 보충합니다.\n'
+            '  재조회 시 늦은 출고분을 보충합니다. 조회 완료일수는 판매 확정을 뜻하지 않습니다.\n'
             '  직접 입력·Excel 매출은 포함하지 않아 일일 매출 탭의 수정값과 다를 수 있습니다.\n'
             '• 입고중: 직접 입력합니다. 입고가 끝나면 남은 수량으로 수정하세요.\n'
-            '• 입고권장 / 소진 예상 / 상품 상태: 최근 30일 판매속도로 자체 계산합니다.\n'
+            '• 입고권장 / 소진 예상 / 상품 상태: 쿠팡 제공 최근 30일 판매속도로 자체 계산합니다.\n'
             '• 판매가: 상품 관리에 저장된 값입니다. 쿠폰·지도가 등은 마진 상세에서 확인합니다.\n'
             '• 개당 예상 마진: 그로스 마진과 같은 원가·사이즈·요금표·수수료율로 계산합니다.\n'
             '  판매가 − 수수료(VAT) − 원가 − 물류비(VAT). 보관비·반품비 등은 제외합니다.\n'
@@ -1164,10 +1171,11 @@ class RocketInventoryPage(tk.Frame):
             return
         columns = [('model', '모델명'), ('product_name', '상품명'), ('option_name', '옵션명'), ('option_id', '옵션ID'),
                    ('stock', '주문가능재고'), ('pending', '입고중_직접입력'), ('recommended', '권장추가입고_자체계산'),
-                   ('pack', '입고단위'), ('sales_30', '30일판매수량_일일매출API'), ('yesterday', '어제판매수량_일일매출API'),
-                   ('last7', '7일판매수량_일일매출API'), ('gap7', '부족분_7일판매x2.5_재고입고중차감'),
-                   ('recorded_days', '7일중조회완료일수'),
-                   ('sales_recorded_days', '30일중조회완료일수'), ('days', '소진예상일수'),
+                   ('pack', '입고단위'), ('sales_30', '30일판매수량_쿠팡재고API'), ('yesterday', '어제판매수량_출고주문_잠정'),
+                   ('last7', '7일판매수량_출고주문_잠정'), ('gap7', '부족분_7일판매x2.5_재고입고중차감'),
+                   ('order_sales_30', '30일판매수량_출고주문_비교용'),
+                   ('recorded_days', '출고주문_7일중조회완료일수'),
+                   ('sales_recorded_days', '출고주문_30일중조회완료일수'), ('days', '소진예상일수'),
                    ('sale_price', '판매가_저장값'), ('coupon_price', '쿠폰가_저장값'), ('estimated_cost', '예상개당비용_자체계산'),
                    ('unit_cost', '원가'), ('logistics', '물류비_VAT포함'),
                    ('margin', '개당예상마진'), ('margin_rate', '예상마진율_퍼센트'), ('margin_missing', '마진미확인사유'),

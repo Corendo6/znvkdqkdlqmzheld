@@ -207,29 +207,30 @@ class SalesTestCase(unittest.TestCase):
              patch.object(rocket_inventory.gross_margin, 'evaluate', return_value=gross):
             return rocket_inventory.build_rows(SimpleNamespace(db=self.db), now=NOW)
 
-    def test_sold_out_option_with_daily_sales_remains_visible(self):
+    def test_sold_out_option_with_inventory_sales_remains_visible(self):
         self.cover()
         self.raw(1, 4)
-        rows = self.inventory(stock=0, inventory_sales=0)
+        rows = self.inventory(stock=0, inventory_sales=4)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['sales_30'], 4)
 
-    def test_inventory_30day_summary_is_not_used_as_sales_source(self):
+    def test_inventory_30day_summary_is_the_inventory_sales_source(self):
         self.cover()
         self.raw(1, 4)
         rows = self.inventory(stock=20, inventory_sales=999)
-        self.assertEqual(rows[0]['sales_30'], 4)
-        self.assertEqual(rows[0]['days'], 150)
+        self.assertEqual(rows[0]['sales_30'], 999)
+        self.assertEqual(rows[0]['order_sales_30'], 4)
+        self.assertAlmostEqual(rows[0]['days'], 20 * 30 / 999)
 
     def test_unknown_sales_does_not_hide_zero_stock_option(self):
-        rows = self.inventory(stock=0, inventory_sales=0)
+        rows = self.inventory(stock=0, inventory_sales=None)
         self.assertEqual(len(rows), 1)
         self.assertIsNone(rows[0]['sales_30'])
         self.assertIsNone(rows[0]['recommended'])
 
     def test_known_zero_sales_hides_zero_stock_option(self):
         self.cover()
-        self.assertEqual(self.inventory(stock=0, inventory_sales=999), [])
+        self.assertEqual(self.inventory(stock=0, inventory_sales=0), [])
 
 
 if __name__ == '__main__':

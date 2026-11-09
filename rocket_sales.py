@@ -171,51 +171,78 @@ def fetch_order_detail(api, order_id, first, last, progress=None):
     return order
 
 
+def _order_query_windows(first, last):
+    """Cover KST days using the API's observed UTC, end-exclusive date bounds.
+
+    Live verification on 2026-11-09: 20261108..20261108 returned no orders;
+    20261108..20261109 returned paidAt from 09:00 KST through next-day 08:59.
+    Pad both edges, split into at most 30 date labels, then filter by paidAt KST.
+    """
+    cursor = first - timedelta(days=1)
+    stop = last + timedelta(days=1)
+    while cursor < stop:
+        boundary = min(cursor + timedelta(days=29), stop)
+        yield cursor, boundary
+        cursor = boundary
+
+
 def fetch_orders(api, start, end, progress=None):
     first, last = validate_period(start, end)
-    params = {'paidDateFrom': first.strftime('%Y%m%d'), 'paidDateTo': last.strftime('%Y%m%d')}
+    padded_first = (first - timedelta(days=1)).isoformat()
+    padded_last = (last + timedelta(days=1)).isoformat()
     path = ORDER_PATH.format(vendorId=api.vendor_id)
-    orders, seen_tokens, repeated_orders = {}, set(), set()
-    for page in range(1, 10001):
-        api.check_cancelled()
-        api.phase = f'로켓그로스 일일 매출 {page}페이지'
-        response = _request_sales(api, path, params, progress)
-        if not isinstance(response, dict) or str(response.get('code')).upper() not in ('200', 'SUCCESS'):
-            raise ValueError('주문 조회 실패: ' + str(response.get('message', '') if isinstance(response, dict) else '응답 형식 오류'))
-        if not isinstance(response.get('data'), list):
-            raise ValueError('주문 목록이 없는 응답입니다. 이전 매출을 유지합니다.')
-        for raw in response['data']:
-            order = normalize_order(raw, api.vendor_id, first.isoformat(), last.isoformat())
-            old = orders.get(order['order_id'])
-            if old is None:
-                orders[order['order_id']] = order
-            else:
-                # Disjoint options can be merged directly. Overlapping options
-                # may be duplicate snapshots OR separate shipment lines, so only
-                # the complete order can resolve their quantities reliably.
-                if old['paid_date'] != order['paid_date'] or set(old['items']) & set(order['items']):
-                    repeated_orders.add(order['order_id'])
-                old['items'].update(order['items'])
-        if progress:
-            progress(f'로켓그로스 일일 매출 {page}페이지 · {len(orders):,}개 주문 수신')
-        token = response.get('nextToken')
-        if token in (None, ''):
+    orders, repeated_orders, selected_orders = {}, set(), set()
+    for window, (query_first, query_last) in enumerate(_order_query_windows(first, last), 1):
+        params = {'paidDateFrom': query_first.strftime('%Y%m%d'),
+                  'paidDateTo': query_last.strftime('%Y%m%d')}
+        seen_tokens = set()
+        for page in range(1, 10001):
             api.check_cancelled()
-            for index, oid in enumerate(sorted(repeated_orders), 1):
-                api.phase = f'나뉜 주문 상세 확인 {index}/{len(repeated_orders)}'
-                if progress:
-                    progress(api.phase)
-                complete = fetch_order_detail(api, oid, first.isoformat(), last.isoformat(), progress)
-                if not set(orders[oid]['items']).issubset(complete['items']):
-                    raise ValueError('주문 상세에서 목록의 일부 옵션을 확인하지 못했습니다. 다시 조회하세요.')
-                orders[oid] = complete
-            return list(orders.values())
-        token = str(token)
-        if token in seen_tokens:
-            raise ValueError('주문 조회 페이지가 반복되었습니다. 이전 매출을 유지합니다.')
-        seen_tokens.add(token)
-        params['nextToken'] = token
-    raise ValueError('주문 조회 페이지 수가 너무 많습니다. 기간을 줄여 다시 조회하세요.')
+            api.phase = f'로켓그로스 일일 매출 {window}구간 {page}페이지'
+            response = _request_sales(api, path, params, progress)
+            if not isinstance(response, dict) or str(response.get('code')).upper() not in ('200', 'SUCCESS'):
+                raise ValueError('주문 조회 실패: ' + str(response.get('message', '') if isinstance(response, dict) else '응답 형식 오류'))
+            if not isinstance(response.get('data'), list):
+                raise ValueError('주문 목록이 없는 응답입니다. 이전 매출을 유지합니다.')
+            for raw in response['data']:
+                order = normalize_order(raw, api.vendor_id, padded_first, padded_last)
+                if start <= order['paid_date'] <= end:
+                    selected_orders.add(order['order_id'])
+                old = orders.get(order['order_id'])
+                if old is None:
+                    orders[order['order_id']] = order
+                else:
+                    # Padding/chunk boundaries never justify guessed sums: overlapping
+                    # options and inconsistent payment dates still require the detail API.
+                    if old['paid_date'] != order['paid_date'] or set(old['items']) & set(order['items']):
+                        repeated_orders.add(order['order_id'])
+                    old['items'].update(order['items'])
+            if progress:
+                progress(f'로켓그로스 일일 매출 {window}구간 {page}페이지 · {len(selected_orders):,}개 주문 수신')
+            token = response.get('nextToken')
+            if token in (None, ''):
+                break
+            token = str(token)
+            if token in seen_tokens:
+                raise ValueError('주문 조회 페이지가 반복되었습니다. 이전 매출을 유지합니다.')
+            seen_tokens.add(token)
+            params['nextToken'] = token
+        else:
+            raise ValueError('주문 조회 페이지 수가 너무 많습니다. 기간을 줄여 다시 조회하세요.')
+    api.check_cancelled()
+    for index, oid in enumerate(sorted(repeated_orders), 1):
+        api.phase = f'나뉜 주문 상세 확인 {index}/{len(repeated_orders)}'
+        if progress:
+            progress(api.phase)
+        # An order observed inside the requested range must not silently move out
+        # of that range during canonical resolution. Padding-only orders may.
+        detail_first, detail_last = (start, end) if oid in selected_orders else (padded_first, padded_last)
+        complete = fetch_order_detail(api, oid, detail_first, detail_last, progress)
+        if not set(orders[oid]['items']).issubset(complete['items']):
+            raise ValueError('주문 상세에서 목록의 일부 옵션을 확인하지 못했습니다. 다시 조회하세요.')
+        orders[oid] = complete
+    api.check_cancelled()
+    return [order for order in orders.values() if start <= order['paid_date'] <= end]
 
 
 def prefer_external_sale(conn, paid_date, model, method, option_id=''):

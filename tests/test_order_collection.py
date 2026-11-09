@@ -19,7 +19,9 @@ class OrderCollectionTests(unittest.TestCase):
         clock = patch.object(rocket_sales, 'today_kst', return_value=TODAY)
         clock.start()
         self.addCleanup(clock.stop)
-        self.first = (TODAY - timedelta(days=30)).isoformat()
+        # These tests isolate pagination/detail behavior in one wire window.
+        # Full 30-day chunking is covered by test_order_date_boundaries.
+        self.first = (TODAY - timedelta(days=7)).isoformat()
         self.last = (TODAY - timedelta(days=1)).isoformat()
 
     def item(self, option='101', quantity=3, price=1000, name='Product'):
@@ -93,8 +95,8 @@ class OrderCollectionTests(unittest.TestCase):
         self.assertEqual(api.requests[1][2], api.requests[2][2])
         self.assertEqual(api.requests[1][2], api.requests[3][2])
         self.assertEqual(api.requests[1][2]['nextToken'], 'opaque+token/==')
-        self.assertEqual(api.requests[1][2]['paidDateFrom'], self.first.replace('-', ''))
-        self.assertEqual(api.requests[1][2]['paidDateTo'], self.last.replace('-', ''))
+        self.assertEqual(api.requests[1][2]['paidDateFrom'], (TODAY - timedelta(days=8)).strftime('%Y%m%d'))
+        self.assertEqual(api.requests[1][2]['paidDateTo'], TODAY.strftime('%Y%m%d'))
         self.assertEqual(self.quantities(), {'101': 2, '102': 4})
 
     def test_json_500_with_rate_limit_message_retries_detail_then_saves(self):
@@ -297,7 +299,7 @@ class OrderCollectionTests(unittest.TestCase):
         metrics = rocket_sales.daily_quantities(self.conn, VENDOR, today=TODAY)['by_option']['101']
         self.assertEqual(metrics['yesterday'], 0)
         self.assertEqual(metrics['last7'], 3)
-        self.assertEqual(metrics['sales_30'], 3)
+        self.assertIsNone(metrics['sales_30'])  # This fixture collected seven days only.
 
     def test_missing_previously_observed_option_rejects_without_partial_save(self):
         self.assert_rejected_without_partial_save(self.order(self.item('102')))

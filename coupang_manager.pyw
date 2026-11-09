@@ -34,7 +34,7 @@ import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.20"
+VERSION = "0.4.21"
 
 
 def resource_path(*parts):
@@ -3777,7 +3777,7 @@ class CoupangManager(tk.Tk):
         self.api_progress.grid(row=5,column=0,columnspan=4,sticky='ew',pady=5)
         ttk.Label(api,textvariable=self.api_status_var,foreground='#245',wraplength=880).grid(row=6,column=0,columnspan=4,sticky='w',pady=(5,8))
         ttk.Label(api,text='전체: 재고 → 일일 매출 → 상품정보·판매상태. 시작 시·주기적 자동 요청은 하지 않습니다.',foreground='#666').grid(row=7,column=0,columnspan=4,sticky='w')
-        ttk.Label(api,text='기본 기간은 어제까지 최근 30일입니다. 재고 화면의 어제·7일·30일 판매수량에 반영됩니다. 재조회로 늦게 출고된 주문을 보충합니다.',foreground='#666',wraplength=880).grid(row=8,column=0,columnspan=4,sticky='w',pady=(5,0))
+        ttk.Label(api,text='주문은 한국시간 기준 어제까지 조회합니다. 재고 화면의 어제·7일은 출고 주문 잠정치, 30일은 재고 API 제공값입니다. 재조회로 늦게 출고된 주문을 보충합니다.',foreground='#666',wraplength=880).grid(row=8,column=0,columnspan=4,sticky='w',pady=(5,0))
         self._update_api_controls()
 
         info=ttk.LabelFrame(self.data_general,text='저장 위치',padding=14);info.pack(fill='x',pady=(0,12))

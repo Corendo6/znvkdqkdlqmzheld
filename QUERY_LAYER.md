@@ -22,11 +22,19 @@
 
 - `read_models.catalog_snapshot`: 최신 로켓그로스 상품과 저장된 옵션·모델 연결
 - `read_models.daily_api_totals`: 판매자·결제일·옵션별 수량, 정확한 Decimal 금액, 주문 수
-- `rocket_sales.daily_quantities`: API 원본만으로 어제·7일·30일 판매량 계산
+- `rocket_sales.daily_quantities`: API 원본만으로 한국시간 어제·7일·30일 출고 주문 잠정치 계산
 - `rocket_sales.rebuild_sales`: 직접 입력·Excel 자료를 우선하면서 편집 가능한 매출표에 반영
 - `rocket_sales.sales_status`: 같은 연결·우선순위 규칙으로 결과 건수만 읽기
 - `gross_margin.load_context/evaluate`: 저장된 원가·요금·수수료를 공유하며 화면별 가격 정책 유지
-- `rocket_inventory.decision_metrics`: 재고 상태·소진 예상·권장입고·7일 부족분 계산
+- `rocket_inventory.decision_metrics`: 재고 API의 30일 판매량으로 재고 상태·소진 예상·권장입고 계산;
+  7일 부족분은 주문 API 잠정치를 사용하며 화면에서 구분합니다.
+
+실제 주문 API 조회(2026-11-09)에서 동일 시작·종료일은 빈 결과를 반환했고,
+20261108→20261109는 한국시간 11월 8일 09시부터 11월 9일 09시 전까지를 반환했습니다.
+따라서 `_order_query_windows`는 요청한 한국 날짜의 전후 UTC 날짜까지 조회하고,
+`fetch_orders`는 한국시간 날짜로 필터합니다. API 제한을 넘지 않게 구간을 분할하고
+모든 구간이 검증된 후에만 저장합니다. 공개 문서에 시간대·종료일 포함 여부가 명시되지
+않아 실제 응답으로 확인한 동작이며, 쿠팡이 규칙을 변경하면 경계 테스트와 함께 재확인해야 합니다.
 
 DB 캐시는 연결별로 관리하고, `total_changes`, `data_version`, `schema_version`으로
 자신의 수정·다른 연결의 저장·스키마 변경을 감지합니다. 진행 중인 트랜잭션은 캐시를
@@ -36,7 +44,8 @@ DB 캐시는 연결별로 관리하고, `total_changes`, `data_version`, `schema
 
 ## 유지해야 할 규칙
 
-- 조회 완료일이 부족하면 판매량은 `None`입니다. 조회가 완료된 무매출만 0입니다.
+- 주문 기반 집계는 조회 완료일이 부족하면 `None`입니다. 조회가 완료된 무매출만 0입니다.
+  재고 화면의 30일은 재고 API의 제공값이며, 미제공이면 주문 합계로 대체하지 않고 `None`입니다.
 - 수동 매출 우선 규칙은 매출표에만 적용합니다. 재고 판매량의 API 원본은 바꾸지 않습니다.
 - 매출 연결은 저장된 옵션 매핑을 우선하고, 마진은 상품의 모델을 우선합니다.
 - 재고 마진은 기준표 판매가로 대체하지 않습니다. 마진 화면의 기존 대체 정책은 유지합니다.
