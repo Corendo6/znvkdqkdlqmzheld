@@ -9,12 +9,13 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import product_search
+import window_tools
 
 SOURCE = Path(__file__).resolve().parents[1] / 'coupang_manager.pyw'
 APP = next(n for n in ast.parse(SOURCE.read_text(encoding='utf-8-sig')).body
            if isinstance(n, ast.ClassDef) and n.name == 'CoupangManager')
 NAMES = {'open_search_dialog', '_search_field', '_set_search_field'}
-scope = dict(tk=tk, ttk=ttk, product_search=product_search)
+scope = dict(tk=tk, ttk=ttk, product_search=product_search, window_tools=window_tools)
 exec(compile(ast.Module(body=[n for n in APP.body if isinstance(n, ast.FunctionDef)
                              and n.name in NAMES], type_ignores=[]), str(SOURCE), 'exec'), scope)
 

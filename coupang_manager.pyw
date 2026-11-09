@@ -29,12 +29,13 @@ import api_query
 import rocket_inventory
 import rocket_sales
 import gross_margin
+import window_tools
 import read_models
 import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.21"
+VERSION = "0.4.22"
 
 
 def resource_path(*parts):
@@ -958,7 +959,6 @@ class FieldDialog(tk.Toplevel):
         super().__init__(parent)
         self.title(title)
         self.transient(parent)
-        self.grab_set()
         self.resizable(True, False)
         self.result = None
         self.vars = {}
@@ -984,14 +984,10 @@ class FieldDialog(tk.Toplevel):
         ttk.Button(btn, text="저장", command=self.save).pack(side="right")
         self.bind("<Return>", lambda e: self.save())
         self.bind("<Escape>", lambda e: self.destroy())
-        self.after(50, self._center)
+        parent.after(50, self._center)
 
     def _center(self):
-        self.update_idletasks()
-        p = self.master
-        x = p.winfo_rootx() + max(20, (p.winfo_width() - self.winfo_width()) // 2)
-        y = p.winfo_rooty() + max(20, (p.winfo_height() - self.winfo_height()) // 3)
-        self.geometry(f"+{x}+{y}")
+        window_tools.place(self, self.master)
 
     def save(self):
         self.result = {k: v.get().strip() for k, v in self.vars.items()}
@@ -1004,7 +1000,6 @@ class ExcelImportDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("Excel 가져오기")
         self.transient(parent)
-        self.grab_set()
         self.resizable(False, False)
         self.result = None
         body = ttk.Frame(self, padding=18)
@@ -1031,14 +1026,10 @@ class ExcelImportDialog(tk.Toplevel):
         ttk.Button(btn, text="취소", command=self.destroy).pack(side="right")
         ttk.Button(btn, text="가져오기", style="Accent.TButton", command=self.save).pack(side="right", padx=(0, 8))
         self.bind("<Escape>", lambda e: self.destroy())
-        self.after(50, self._center)
+        parent.after(50, self._center)
 
     def _center(self):
-        self.update_idletasks()
-        p = self.master
-        x = p.winfo_rootx() + max(20, (p.winfo_width() - self.winfo_width()) // 2)
-        y = p.winfo_rooty() + max(20, (p.winfo_height() - self.winfo_height()) // 3)
-        self.geometry(f"+{x}+{y}")
+        window_tools.place(self, self.master)
 
     def save(self):
         try:
@@ -1192,12 +1183,6 @@ class CoupangManager(tk.Tk):
         return getattr(self, variable), refresh
 
     def open_search_dialog(self, event=None):
-        dialog = self._search_dialog
-        if dialog is not None and dialog.winfo_exists():
-            dialog.lift()
-            dialog.search_entry.focus_set()
-            dialog.search_entry.selection_range(0, 'end')
-            return 'break'
         # Leave an already open edit/settings dialog in charge of its inputs.
         if self.grab_current() is not None:
             return 'break'
@@ -1235,8 +1220,8 @@ class CoupangManager(tk.Tk):
                   foreground='#666').pack(anchor='w', pady=(8, 14))
 
         def close(event=None):
-            self._search_dialog = None
-            dialog.grab_release()
+            if self._search_dialog is dialog:
+                self._search_dialog = None
             dialog.destroy()
             if previous_focus is not None and previous_focus.winfo_exists():
                 previous_focus.focus_set()
@@ -1266,11 +1251,7 @@ class CoupangManager(tk.Tk):
         dialog.bind('<Return>', apply)
         dialog.bind('<Escape>', close)
         dialog.bind('<F5>', self.open_search_dialog)
-        dialog.update_idletasks()
-        x = max(0, self.winfo_rootx() + (self.winfo_width() - dialog.winfo_reqwidth()) // 2)
-        y = max(0, self.winfo_rooty() + (self.winfo_height() - dialog.winfo_reqheight()) // 2)
-        dialog.geometry(f'+{x}+{y}')
-        dialog.grab_set()
+        window_tools.place(dialog, self)
         entry.focus_set()
         entry.selection_range(0, 'end')
         return 'break'
@@ -1947,6 +1928,7 @@ class CoupangManager(tk.Tk):
         self._reset_product_page_and_refresh()
 
     def refresh_products(self):
+        if not window_tools.exists(getattr(self, 'prod_tree', None)): return
         if hasattr(self,'prod_search_label') and self.prod_search_label.winfo_exists():
             query=self.prod_q.get().strip()
             self.prod_search_label.configure(text=(self._search_field('products')+': '+query[:28]+('…' if len(query)>28 else '')) if query else '')
@@ -2129,8 +2111,8 @@ class CoupangManager(tk.Tk):
             self.edit_product()
         return 'break'
 
-    def show_exposure_history(self):
-        ids=self._selected_product_ids(include_group_children=True)
+    def show_exposure_history(self, ids=None):
+        ids=ids if ids is not None else self._selected_product_ids(include_group_children=True)
         if not ids:
             return messagebox.showinfo(APP_NAME,'노출상품 ID 이력을 확인할 옵션 행을 선택하세요.')
         placeholders=','.join('?' for _ in ids)
@@ -2202,7 +2184,7 @@ class CoupangManager(tk.Tk):
         ttk.Button(bottom,text='선택 상품 열기',command=open_pid).pack(side='left')
         ttk.Button(bottom,text='노출 ID 복사',command=copy_pid).pack(side='left',padx=6)
         ttk.Button(bottom,text='닫기',command=win.destroy).pack(side='right')
-        win.grab_set()
+        window_tools.place(win, self)
 
     def update_product_detail(self):
         if not hasattr(self,'prod_detail_var'): return
@@ -2242,15 +2224,12 @@ class CoupangManager(tk.Tk):
         row=self.selected_product()
         if row is None:
             return messagebox.showinfo(APP_NAME,'상세정보를 볼 옵션 행을 선택하세요.')
-        current=getattr(self,'_product_detail_dialog',None)
-        if current is not None and current.winfo_exists():
-            current.lift(); return
         win=tk.Toplevel(self); self._product_detail_dialog=win
         win.title('상품 옵션 상세'); win.geometry('820x660'); win.minsize(680,620)
         win.transient(self)
         def close():
             win.destroy()
-            if self.prod_tree.winfo_exists(): self.prod_tree.focus_set()
+            if window_tools.exists(getattr(self, 'prod_tree', None)): self.prod_tree.focus_set()
         win.protocol('WM_DELETE_WINDOW',close)
         content=ttk.Frame(win,padding=18); content.pack(fill='both',expand=True)
         ttk.Label(content,text=row['product_name'] or row['display_name'] or '상품 옵션',
@@ -2275,25 +2254,27 @@ class CoupangManager(tk.Tk):
         buttons=ttk.Frame(content); buttons.pack(fill='x',side='bottom',pady=(12,0))
         ttk.Button(buttons,text='전체 정보 복사',command=lambda:self._clipboard_set('\r\n'.join(f'{k}\t{v or "—"}' for k,v in fields))).pack(side='left')
         def history():
-            close(); self.show_exposure_history()
+            self.show_exposure_history([row['id']])
         ttk.Button(buttons,text='노출ID 이력',command=history).pack(side='left',padx=6)
-        ttk.Button(buttons,text='쿠팡 상품 열기',command=self.open_product_link).pack(side='left')
+        ttk.Button(buttons,text='쿠팡 상품 열기',command=lambda:webbrowser.open_new_tab(self._resolved_product_link(row))).pack(side='left')
         ttk.Button(buttons,text='닫기',command=close).pack(side='right')
         win.bind('<Escape>',lambda e:close())
-        win.grab_set()
+        window_tools.place(win, self)
         win.focus_set()
 
     def product_fields(self):
         return [('fulfillment_type','배송방식','combo',['판매자배송','로켓그로스']),('sale_status','판매상태','combo',['미확인','판매중','품절','판매중지']),('category','분류'),('model','모델명'),('product_name','상품명'),('display_name','노출명'),('registered_product_id','등록상품 ID'),('exposed_product_id','노출상품 ID'),('option_name','옵션명'),('option_id','옵션 ID'),('gift','사은품'),('sale_price','판매가'),('coupon_price','쿠폰적용가'),('map_price','지도가'),('link','링크'),('note','비고')]
 
     def add_product(self):
-        d=FieldDialog(self,'상품 추가',self.product_fields(),{'fulfillment_type':'판매자배송','sale_status':'미확인'}); self.wait_window(d)
-        if not d.result: return
-        v=d.result
-        if not v['model']: return messagebox.showwarning(APP_NAME,'모델명을 입력하세요.')
-        sale=num(v['sale_price'],None); mapp=num(v['map_price'],None); diff=(sale-mapp) if sale is not None and mapp is not None else None
-        self.db.execute('''INSERT INTO products(category,fulfillment_type,status,sale_status,model,product_name,display_name,registered_product_id,exposed_product_id,option_name,option_id,gift,sale_price,coupon_price,map_price,price_diff,link,note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(v['category'],v['fulfillment_type'],'',v['sale_status'],v['model'],v['product_name'],v['display_name'],v['registered_product_id'],v['exposed_product_id'],v['option_name'],v['option_id'],v['gift'],sale,num(v['coupon_price'],None),mapp,diff,v['link'],v['note']))
-        self.refresh_products()
+        d=FieldDialog(self,'상품 추가',self.product_fields(),{'fulfillment_type':'판매자배송','sale_status':'미확인'})
+        def finish():
+            if not d.result: return
+            v=d.result
+            if not v['model']: return messagebox.showwarning(APP_NAME,'모델명을 입력하세요.')
+            sale=num(v['sale_price'],None); mapp=num(v['map_price'],None); diff=(sale-mapp) if sale is not None and mapp is not None else None
+            self.db.execute('''INSERT INTO products(category,fulfillment_type,status,sale_status,model,product_name,display_name,registered_product_id,exposed_product_id,option_name,option_id,gift,sale_price,coupon_price,map_price,price_diff,link,note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(v['category'],v['fulfillment_type'],'',v['sale_status'],v['model'],v['product_name'],v['display_name'],v['registered_product_id'],v['exposed_product_id'],v['option_name'],v['option_id'],v['gift'],sale,num(v['coupon_price'],None),mapp,diff,v['link'],v['note']))
+            self.refresh_products()
+        window_tools.when_closed(d, finish)
 
     def selected_product(self):
         sel=self.prod_tree.selection() if hasattr(self,'prod_tree') else ()
@@ -2305,15 +2286,17 @@ class CoupangManager(tk.Tk):
     def edit_product(self):
         r=self.selected_product()
         if not r: return messagebox.showinfo(APP_NAME,'수정할 옵션 행을 선택하세요.')
-        vals={k:r[k] for k, *_ in self.product_fields()}; d=FieldDialog(self,'상품 수정',self.product_fields(),vals); self.wait_window(d)
-        if not d.result: return
-        v=d.result; sale=num(v['sale_price'],None); mapp=num(v['map_price'],None); diff=(sale-mapp) if sale is not None and mapp is not None else None
-        self.db.execute('''UPDATE products SET category=?,fulfillment_type=?,status=?,sale_status=?,model=?,product_name=?,display_name=?,registered_product_id=?,exposed_product_id=?,option_name=?,option_id=?,gift=?,sale_price=?,coupon_price=?,map_price=?,price_diff=?,link=?,note=?,updated_at=CURRENT_TIMESTAMP WHERE id=?''',(v['category'],v['fulfillment_type'],str(r['status'] or ''),v['sale_status'],v['model'],v['product_name'],v['display_name'],v['registered_product_id'],v['exposed_product_id'],v['option_name'],v['option_id'],v['gift'],sale,num(v['coupon_price'],None),mapp,diff,v['link'],v['note'],r['id']))
-        if str(v.get('exposed_product_id') or '').strip():
-            self._record_exposure(self.db,v.get('option_id',''),r['seller_product_item_id'],v.get('registered_product_id',''),v.get('exposed_product_id',''),v.get('model',''),v.get('option_name',''),'manual',r['id'])
-            self._record_product_event(self.db,'exposure_id',r,r['exposed_product_id'],v.get('exposed_product_id',''),'manual')
-            self.db.conn.commit()
-        self.refresh_products()
+        vals={k:r[k] for k, *_ in self.product_fields()}; d=FieldDialog(self,'상품 수정',self.product_fields(),vals)
+        def finish():
+            if not d.result: return
+            v=d.result; sale=num(v['sale_price'],None); mapp=num(v['map_price'],None); diff=(sale-mapp) if sale is not None and mapp is not None else None
+            self.db.execute('''UPDATE products SET category=?,fulfillment_type=?,status=?,sale_status=?,model=?,product_name=?,display_name=?,registered_product_id=?,exposed_product_id=?,option_name=?,option_id=?,gift=?,sale_price=?,coupon_price=?,map_price=?,price_diff=?,link=?,note=?,updated_at=CURRENT_TIMESTAMP WHERE id=?''',(v['category'],v['fulfillment_type'],str(r['status'] or ''),v['sale_status'],v['model'],v['product_name'],v['display_name'],v['registered_product_id'],v['exposed_product_id'],v['option_name'],v['option_id'],v['gift'],sale,num(v['coupon_price'],None),mapp,diff,v['link'],v['note'],r['id']))
+            if str(v.get('exposed_product_id') or '').strip():
+                self._record_exposure(self.db,v.get('option_id',''),r['seller_product_item_id'],v.get('registered_product_id',''),v.get('exposed_product_id',''),v.get('model',''),v.get('option_name',''),'manual',r['id'])
+                self._record_product_event(self.db,'exposure_id',r,r['exposed_product_id'],v.get('exposed_product_id',''),'manual')
+                self.db.conn.commit()
+            self.refresh_products()
+        window_tools.when_closed(d, finish)
 
     def delete_product(self):
         sel=self.prod_tree.selection() if hasattr(self,'prod_tree') else ()
@@ -2768,6 +2751,7 @@ class CoupangManager(tk.Tk):
         messagebox.showinfo(APP_NAME,f"옵션ID → 모델명 매핑을 다시 만들었습니다.\n추가 {r['inserted']} / 갱신 {r['updated']} / 유지 {r['skipped']}")
 
     def refresh_model_master(self):
+        if not window_tools.exists(getattr(self, 'model_tree', None)): return
         self._sync_option_model_map_from_products()
         query=self.model_q.get().strip() if hasattr(self,'model_q') else ''
         field=self._search_field('master')
@@ -2854,63 +2838,67 @@ class CoupangManager(tk.Tk):
         if not sel:
             return messagebox.showinfo(APP_NAME,'모델명을 지정할 미매칭 옵션을 선택하세요.')
         models=self.db.distinct_models()
-        d=FieldDialog(self,'미매칭 옵션 모델 지정',[('model','모델명','combo',models)],{'model':''}); self.wait_window(d)
-        if not d.result or not d.result.get('model'):
-            return
-        model=d.result['model'].strip(); ids=[str(i) for i in sel]
-        self.db.conn.executemany("INSERT OR REPLACE INTO option_model_map(option_id,model,source,updated_at) VALUES (?,?,'manual',CURRENT_TIMESTAMP)",[(oid,model) for oid in ids])
-        self.db.conn.executemany("UPDATE products SET model=?,updated_at=CURRENT_TIMESTAMP WHERE option_id=? AND COALESCE(TRIM(model),'')=''",[(model,oid) for oid in ids])
-        self.db.conn.commit()
-        moved=self._materialize_pending_sales(ids)
-        self.refresh_model_master()
-        try:
-            if hasattr(self,'sales_tree') and self.sales_tree.winfo_exists(): self.refresh_sales()
-        except Exception: pass
-        messagebox.showinfo(APP_NAME,f"{len(ids)}개 옵션을 {model}에 연결했습니다.\n대기 매출 반영: 추가 {moved['inserted']} / 갱신 {moved['updated']}\nAPI 매출 모델 연결: {moved.get('api_updated',0)}건")
+        d=FieldDialog(self,'미매칭 옵션 모델 지정',[('model','모델명','combo',models)],{'model':''})
+        def finish():
+            if not d.result or not d.result.get('model'):
+                return
+            model=d.result['model'].strip(); ids=[str(i) for i in sel]
+            self.db.conn.executemany("INSERT OR REPLACE INTO option_model_map(option_id,model,source,updated_at) VALUES (?,?,'manual',CURRENT_TIMESTAMP)",[(oid,model) for oid in ids])
+            self.db.conn.executemany("UPDATE products SET model=?,updated_at=CURRENT_TIMESTAMP WHERE option_id=? AND COALESCE(TRIM(model),'')=''",[(model,oid) for oid in ids])
+            self.db.conn.commit()
+            moved=self._materialize_pending_sales(ids)
+            self.refresh_model_master()
+            try:
+                if hasattr(self,'sales_tree') and self.sales_tree.winfo_exists(): self.refresh_sales()
+            except Exception: pass
+            messagebox.showinfo(APP_NAME,f"{len(ids)}개 옵션을 {model}에 연결했습니다.\n대기 매출 반영: 추가 {moved['inserted']} / 갱신 {moved['updated']}\nAPI 매출 모델 연결: {moved.get('api_updated',0)}건")
+        window_tools.when_closed(d, finish)
 
     def import_coupang_sales_excel(self):
         path=filedialog.askopenfilename(title='쿠팡 일일매출 파일 가져오기',filetypes=[('쿠팡 Excel','*.xlsx'),('Excel','*.xlsx *.xlsm'),('모든 파일','*.*')])
         if not path: return
-        d=FieldDialog(self,'쿠팡 일일매출 가져오기',[('sale_date','매출 기준일 (YYYY-MM-DD)')],{'sale_date':(date.today()-timedelta(days=1)).isoformat()}); self.wait_window(d)
-        if not d.result: return
-        sale_date=d.result.get('sale_date','').strip()
-        try: datetime.strptime(sale_date,'%Y-%m-%d')
-        except Exception: return messagebox.showwarning(APP_NAME,'매출 기준일을 YYYY-MM-DD 형식으로 입력하세요.')
-        legacy_count=self.db.one("SELECT COUNT(*) n FROM sales WHERE sale_date=? AND COALESCE(TRIM(option_id),'')=''",(sale_date,))['n']
-        if legacy_count:
-            if not messagebox.askyesno(APP_NAME,f'{sale_date}에 기존 방식으로 저장된 매출 {legacy_count}건이 있습니다.\n이 날짜를 다시 가져오면 기존 합계와 중복 집계될 수 있습니다.\n\n그래도 계속할까요?'):
-                return
-        try:
-            from openpyxl import load_workbook
-        except Exception:
-            return messagebox.showerror(APP_NAME,'Excel 가져오기에 필요한 openpyxl 모듈을 찾을 수 없습니다.')
-        try:
-            wb=load_workbook(path,read_only=True,data_only=True)
-        except Exception as e:
-            return messagebox.showerror(APP_NAME,f'쿠팡 매출 파일을 열지 못했습니다.\n\n{e}')
-        self._sync_option_model_map_from_products()
-        self._auto_repair_model_links(self.db)
-        result=None
-        try:
-            for ws in wb.worksheets:
-                r=self._import_coupang_sales_sheet(ws,sale_date,Path(path).name)
-                if r is not None:
-                    result=r; break
-        finally:
-            try: wb.close()
+        d=FieldDialog(self,'쿠팡 일일매출 가져오기',[('sale_date','매출 기준일 (YYYY-MM-DD)')],{'sale_date':(date.today()-timedelta(days=1)).isoformat()})
+        def finish():
+            if not d.result: return
+            sale_date=d.result.get('sale_date','').strip()
+            try: datetime.strptime(sale_date,'%Y-%m-%d')
+            except Exception: return messagebox.showwarning(APP_NAME,'매출 기준일을 YYYY-MM-DD 형식으로 입력하세요.')
+            legacy_count=self.db.one("SELECT COUNT(*) n FROM sales WHERE sale_date=? AND COALESCE(TRIM(option_id),'')=''",(sale_date,))['n']
+            if legacy_count:
+                if not messagebox.askyesno(APP_NAME,f'{sale_date}에 기존 방식으로 저장된 매출 {legacy_count}건이 있습니다.\n이 날짜를 다시 가져오면 기존 합계와 중복 집계될 수 있습니다.\n\n그래도 계속할까요?'):
+                    return
+            try:
+                from openpyxl import load_workbook
+            except Exception:
+                return messagebox.showerror(APP_NAME,'Excel 가져오기에 필요한 openpyxl 모듈을 찾을 수 없습니다.')
+            try:
+                wb=load_workbook(path,read_only=True,data_only=True)
+            except Exception as e:
+                return messagebox.showerror(APP_NAME,f'쿠팡 매출 파일을 열지 못했습니다.\n\n{e}')
+            self._sync_option_model_map_from_products()
+            self._auto_repair_model_links(self.db)
+            result=None
+            try:
+                for ws in wb.worksheets:
+                    r=self._import_coupang_sales_sheet(ws,sale_date,Path(path).name)
+                    if r is not None:
+                        result=r; break
+            finally:
+                try: wb.close()
+                except Exception: pass
+            if result is None:
+                return messagebox.showwarning(APP_NAME,'쿠팡 일일매출 형식을 찾지 못했습니다.\n필수 컬럼: 옵션 ID / 옵션명 / 판매방식 / 매출(원) / 주문 / 판매량')
+            self.db.conn.commit()
+            self.db.set_setting('sales_insights_last_import',datetime.now().isoformat(timespec='seconds'))
+            self.db.set_setting('sales_insights_last_date',sale_date)
+            try: self.refresh_sales()
             except Exception: pass
-        if result is None:
-            return messagebox.showwarning(APP_NAME,'쿠팡 일일매출 형식을 찾지 못했습니다.\n필수 컬럼: 옵션 ID / 옵션명 / 판매방식 / 매출(원) / 주문 / 판매량')
-        self.db.conn.commit()
-        self.db.set_setting('sales_insights_last_import',datetime.now().isoformat(timespec='seconds'))
-        self.db.set_setting('sales_insights_last_date',sale_date)
-        try: self.refresh_sales()
-        except Exception: pass
-        try:
-            if hasattr(self,'model_tree') and self.model_tree.winfo_exists(): self.refresh_model_master()
-        except Exception: pass
-        messagebox.showinfo(APP_NAME,
-            f"쿠팡 일일매출 가져오기 완료 ({sale_date})\n\n추가 {result['inserted']} / 갱신 {result['updated']} / 동일 {result['skipped']}\n모델 자동연결 {result.get('autoMatched',0)} / 0매출 제외 {result['zero']}\n미매칭 옵션 {result['unmatched']}개 → 마스터 데이터의 '미매칭 옵션'에 저장\n\n애매한 항목만 미매칭으로 남기며, 모델명 한 번 지정하면 이후 자동 연결됩니다.")
+            try:
+                if hasattr(self,'model_tree') and self.model_tree.winfo_exists(): self.refresh_model_master()
+            except Exception: pass
+            messagebox.showinfo(APP_NAME,
+                f"쿠팡 일일매출 가져오기 완료 ({sale_date})\n\n추가 {result['inserted']} / 갱신 {result['updated']} / 동일 {result['skipped']}\n모델 자동연결 {result.get('autoMatched',0)} / 0매출 제외 {result['zero']}\n미매칭 옵션 {result['unmatched']}개 → 마스터 데이터의 '미매칭 옵션'에 저장\n\n애매한 항목만 미매칭으로 남기며, 모델명 한 번 지정하면 이후 자동 연결됩니다.")
+        window_tools.when_closed(d, finish)
 
     def _import_coupang_sales_sheet(self, ws, sale_date, source_file):
         rows=ws.iter_rows(values_only=True)
@@ -3061,6 +3049,7 @@ class CoupangManager(tk.Tk):
         self.refresh_gross_margin()
 
     def refresh_gross_margin(self):
+        if not window_tools.exists(getattr(self, 'gross_margin_tree', None)): return
         if not hasattr(self,'gross_margin_tree'):
             return
         try:
@@ -3151,10 +3140,6 @@ class CoupangManager(tk.Tk):
         webbrowser.open(link)
 
     def edit_selected_gross_margin(self):
-        existing=getattr(self,'_gross_margin_edit_dialog',None)
-        if existing is not None and existing.winfo_exists():
-            existing.lift(); existing.cost_entry.focus_set()
-            return 'break'
         r=self._selected_gross_margin_row()
         if not r:
             messagebox.showinfo(APP_NAME,'수정할 모델 행을 선택하세요.')
@@ -3163,7 +3148,7 @@ class CoupangManager(tk.Tk):
             messagebox.showinfo(APP_NAME,'마스터 데이터 > 모델·옵션 매핑에서 모델을 먼저 연결하세요.')
             return 'break'
         win=tk.Toplevel(self); self._gross_margin_edit_dialog=win
-        win.title('그로스 마진 수정'); win.transient(self); win.grab_set(); win.resizable(False,False)
+        win.title('그로스 마진 수정'); win.transient(self); win.resizable(False,False)
         frame=ttk.Frame(win,padding=20); frame.pack(fill='both',expand=True)
         ttk.Label(frame,text=r['model'],font=('맑은 고딕',14,'bold')).grid(row=0,column=0,columnspan=2,sticky='w')
         ttk.Label(frame,text=r['option_name'] or r['product_name'],wraplength=440).grid(row=1,column=0,columnspan=2,sticky='w',pady=(6,14))
@@ -3202,7 +3187,7 @@ class CoupangManager(tk.Tk):
                   foreground='#666',justify='left',wraplength=440).grid(row=7,column=0,columnspan=2,sticky='w',pady=(10,8))
         def close(event=None):
             win.destroy()
-            if self.gross_margin_tree.winfo_exists(): self.gross_margin_tree.focus_set()
+            if window_tools.exists(getattr(self, 'gross_margin_tree', None)): self.gross_margin_tree.focus_set()
             return 'break'
         def save(event=None):
             if copied_size.get().strip() and not gross_margin.parse_coupang_size(copied_size.get()):
@@ -3235,17 +3220,14 @@ class CoupangManager(tk.Tk):
                     return 'break'
             iid='g:'+str(r['id'])
             close(); self.refresh_gross_margin()
-            if self.gross_margin_tree.exists(iid):
+            if window_tools.exists(getattr(self, 'gross_margin_tree', None)) and self.gross_margin_tree.exists(iid):
                 self.gross_margin_tree.selection_set(iid); self.gross_margin_tree.focus(iid); self.gross_margin_tree.see(iid)
             return 'break'
         buttons=ttk.Frame(frame); buttons.grid(row=8,column=0,columnspan=2,sticky='e',pady=(12,0))
         ttk.Button(buttons,text='취소',command=close).pack(side='left',padx=4)
         ttk.Button(buttons,text='저장',style='Accent.TButton',command=save).pack(side='left',padx=4)
         win.bind('<Escape>',close); win.bind('<Return>',save); win.protocol('WM_DELETE_WINDOW',close)
-        win.update_idletasks()
-        x=max(0,self.winfo_rootx()+(self.winfo_width()-win.winfo_reqwidth())//2)
-        y=max(0,self.winfo_rooty()+(self.winfo_height()-win.winfo_reqheight())//2)
-        win.geometry(f'+{x}+{y}')
+        window_tools.place(win, self)
         entry.focus_set(); entry.selection_range(0,'end')
         return 'break'
 
@@ -3553,44 +3535,46 @@ class CoupangManager(tk.Tk):
         if not available:
             wb.close()
             return messagebox.showwarning(APP_NAME,'지원하는 시트를 찾지 못했습니다.\n지원 시트: 등록관리 / 그로스 입고 관리 / 일일 매출')
-        dlg=ExcelImportDialog(self,available,self._infer_excel_year(wb)); self.wait_window(dlg)
-        if not dlg.result:
-            wb.close(); return
-        backup=self._excel_backup_before_import()
-        results={}
-        try:
-            self.db.conn.execute('BEGIN')
-            if '등록관리' in dlg.result['sheets']:
-                results['등록관리']=self._import_excel_products(wb['등록관리'])
-            if '그로스 입고 관리' in dlg.result['sheets']:
-                results['그로스 입고 관리']=self._import_excel_inbounds(wb['그로스 입고 관리'],dlg.result['year'])
-            if '일일 매출' in dlg.result['sheets']:
-                results['일일 매출']=self._import_excel_sales(wb['일일 매출'])
-            self.db.conn.commit()
-        except Exception as e:
-            self.db.conn.rollback()
-            LOGGER.exception('Excel 가져오기 실패: %s',path)
-            wb.close()
-            return messagebox.showerror(APP_NAME,f'Excel 가져오기 중 오류가 발생했습니다.\n변경사항은 취소했습니다.\n\n{e}')
-        finally:
-            try: wb.close()
+        dlg=ExcelImportDialog(self,available,self._infer_excel_year(wb))
+        def finish():
+            if not dlg.result:
+                wb.close(); return
+            backup=self._excel_backup_before_import()
+            results={}
+            try:
+                self.db.conn.execute('BEGIN')
+                if '등록관리' in dlg.result['sheets']:
+                    results['등록관리']=self._import_excel_products(wb['등록관리'])
+                if '그로스 입고 관리' in dlg.result['sheets']:
+                    results['그로스 입고 관리']=self._import_excel_inbounds(wb['그로스 입고 관리'],dlg.result['year'])
+                if '일일 매출' in dlg.result['sheets']:
+                    results['일일 매출']=self._import_excel_sales(wb['일일 매출'])
+                self.db.conn.commit()
+            except Exception as e:
+                self.db.conn.rollback()
+                LOGGER.exception('Excel 가져오기 실패: %s',path)
+                wb.close()
+                return messagebox.showerror(APP_NAME,f'Excel 가져오기 중 오류가 발생했습니다.\n변경사항은 취소했습니다.\n\n{e}')
+            finally:
+                try: wb.close()
+                except Exception: pass
+            lines=[]
+            for name,r in results.items():
+                if name=='등록관리':
+                    lines.append(f"상품: 추가 {r['inserted']} / 갱신 {r['updated']} / 건너뜀 {r['skipped']}")
+                elif name=='그로스 입고 관리':
+                    lines.append(f"입고: 추가 {r['inserted']} / 갱신 {r['updated']} / 동일 {r['skipped']} / 충돌 {r['conflicts']}")
+                elif name=='일일 매출':
+                    lines.append(f"매출: 추가 {r['inserted']} / 동일 {r['skipped']}")
+            LOGGER.info('Excel 가져오기 완료 file=%s result=%s backup=%s',path,results,backup)
+            messagebox.showinfo(APP_NAME,'Excel 가져오기가 완료되었습니다.\n\n'+'\n'.join(lines)+f'\n\n자동 백업: {backup.name}')
+            try:
+                if hasattr(self,'prod_tree') and self.prod_tree.winfo_exists(): self.refresh_products()
             except Exception: pass
-        lines=[]
-        for name,r in results.items():
-            if name=='등록관리':
-                lines.append(f"상품: 추가 {r['inserted']} / 갱신 {r['updated']} / 건너뜀 {r['skipped']}")
-            elif name=='그로스 입고 관리':
-                lines.append(f"입고: 추가 {r['inserted']} / 갱신 {r['updated']} / 동일 {r['skipped']} / 충돌 {r['conflicts']}")
-            elif name=='일일 매출':
-                lines.append(f"매출: 추가 {r['inserted']} / 동일 {r['skipped']}")
-        LOGGER.info('Excel 가져오기 완료 file=%s result=%s backup=%s',path,results,backup)
-        messagebox.showinfo(APP_NAME,'Excel 가져오기가 완료되었습니다.\n\n'+'\n'.join(lines)+f'\n\n자동 백업: {backup.name}')
-        try:
-            if hasattr(self,'prod_tree') and self.prod_tree.winfo_exists(): self.refresh_products()
-        except Exception: pass
-        try:
-            if hasattr(self,'sales_tree') and self.sales_tree.winfo_exists(): self.refresh_sales()
-        except Exception: pass
+            try:
+                if hasattr(self,'sales_tree') and self.sales_tree.winfo_exists(): self.refresh_sales()
+            except Exception: pass
+        window_tools.when_closed(dlg, finish)
 
     def _import_excel_products(self, ws):
         rows=ws.iter_rows(values_only=True); headers=[self._excel_text(v) for v in next(rows)]; idx={h:i for i,h in enumerate(headers) if h}
@@ -4039,7 +4023,7 @@ class CoupangManager(tk.Tk):
             self._refresh_product_dashboard_cards()
             self._refresh_product_dashboard_events()
         elif page == 'margin' and getattr(self, 'gross_margin_tree', None):
-            if self.gross_margin_tree.winfo_exists():
+            if window_tools.exists(getattr(self, 'gross_margin_tree', None)):
                 self.refresh_gross_margin()
         elif page == 'master':
             self.refresh_model_master()

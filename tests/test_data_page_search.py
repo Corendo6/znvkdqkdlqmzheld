@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import product_search
+import window_tools
 import rocket_sales
 
 
@@ -68,7 +69,7 @@ class DataPageSearchTests(unittest.TestCase):
             multitap_only_enabled=Mock(return_value=False), visible_models=Mock(return_value=['MODEL-A']),
             _multitap_product_clause=lambda alias: f"{alias}.model='MODEL-A'",
             _resolved_product_link=lambda row: '')
-        scope = dict(product_search=product_search, rocket_sales=rocket_sales, money=str)
+        scope = dict(product_search=product_search, rocket_sales=rocket_sales, money=str, window_tools=window_tools)
         methods = [n for n in APP.body if isinstance(n, ast.FunctionDef) and n.name in NAMES]
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(SOURCE), 'exec'), scope)
         for name in NAMES:

@@ -7,6 +7,7 @@ Missing observations remain unknown; inbound quantities are explicitly manual.
 import csv
 import api_query
 import gross_margin
+import window_tools
 import product_search
 import read_models
 import rocket_sales
@@ -1006,20 +1007,16 @@ class RocketInventoryPage(tk.Frame):
         self.pending_dialog(rows)
 
     def _dialog(self, title):
-        win = tk.Toplevel(self)
+        win = tk.Toplevel(self.winfo_toplevel())
         win.title(title)
         win.transient(self.winfo_toplevel())
         win.resizable(False, False)
         frame = ttk.Frame(win, padding=22)
         frame.pack(fill='both', expand=True)
-        win.grab_set()
+        win.master.after_idle(lambda: window_tools.place(win, win.master))
         return win, frame
 
     def margin_detail_dialog(self, row):
-        existing = getattr(self, 'margin_window', None)
-        if existing is not None and existing.winfo_exists():
-            existing.lift()
-            return
         context = gross_margin.load_context(self.app.db)
         current = gross_margin.evaluate(row, context, allow_reference_price=False)
         win, frame = self._dialog('현재 판매가 마진 상세')
@@ -1064,23 +1061,17 @@ class RocketInventoryPage(tk.Frame):
                   foreground=MUTED).grid(row=14, column=0, columnspan=2, sticky='w', pady=(3, 12))
         def close(event=None):
             win.destroy()
-            self.canvas.focus_set()
+            if window_tools.exists(self.canvas): self.canvas.focus_set()
         ttk.Button(frame, text='닫기', command=close).grid(row=15, column=1, sticky='e')
         win.bind('<Escape>', close)
         win.protocol('WM_DELETE_WINDOW', close)
-        win.update_idletasks()
-        parent = self.winfo_toplevel()
-        x = parent.winfo_rootx()+max(0, (parent.winfo_width()-win.winfo_width())//2)
-        y = parent.winfo_rooty()+max(0, (parent.winfo_height()-win.winfo_height())//2)
-        x = max(0, min(x, win.winfo_screenwidth()-win.winfo_width()))
-        y = max(0, min(y, win.winfo_screenheight()-win.winfo_height()-40))
-        win.geometry(f'+{x}+{y}')
         win.focus_set()
 
     def pending_dialog(self, rows):
         if any(not r.get('option_id') for r in rows):
             messagebox.showinfo('입고중 관리', '옵션 ID가 없는 상품은 상품정보를 먼저 연결하세요.')
             return
+        vendor = self.app.db.setting('api_vendor_id', '').strip()
         win, frame = self._dialog('입고중 수량 관리')
         ttk.Label(frame, text=f'{len(rows)}개 옵션의 입고중 수량', font=(self.font, 13, 'bold')).grid(row=0, column=0, columnspan=2, sticky='w')
         ttk.Label(frame, text='이미 보냈지만 판매가능 재고에 아직 반영되지 않은 수량입니다.\n완료된 물량은 제외하고, 남은 입고중 수량을 입력하세요.').grid(row=1, column=0, columnspan=2, sticky='w', pady=(10, 16))
@@ -1093,14 +1084,13 @@ class RocketInventoryPage(tk.Frame):
             ttk.Label(frame, text='선택한 각 옵션에 같은 수량·입고 단위·메모를 적용합니다.', foreground='#a65c12').grid(row=5, column=0, columnspan=2, sticky='w', pady=8)
         def save():
             try:
-                vendor = self.app.db.setting('api_vendor_id', '').strip()
                 save_pending(self.app.db.conn, vendor, [r['option_id'] for r in rows],
                              variables[0].get(), variables[1].get(), variables[2].get())
             except (ValueError, sqlite3.Error) as exc:
                 messagebox.showerror('입고중 관리', str(exc), parent=win)
                 return
             win.destroy()
-            self.refresh()
+            if window_tools.exists(self): self.refresh()
         ttk.Button(frame, text='저장', command=save).grid(row=6, column=1, sticky='e', pady=(15, 0))
         ttk.Button(frame, text='취소', command=win.destroy).grid(row=6, column=0, sticky='w', pady=(15, 0))
 
@@ -1128,7 +1118,7 @@ class RocketInventoryPage(tk.Frame):
                 messagebox.showerror('계산 기준', str(exc), parent=win)
                 return
             win.destroy()
-            self.refresh()
+            if window_tools.exists(self): self.refresh()
         ttk.Button(frame, text='저장', command=save).grid(row=5, column=1, sticky='e')
 
     def show_help(self):
