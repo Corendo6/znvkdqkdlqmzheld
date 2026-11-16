@@ -1,5 +1,6 @@
 """Field searches follow a sale's actual option and preserve existing visibility rules."""
 import ast
+from datetime import timedelta
 from pathlib import Path
 import sqlite3
 import sys
@@ -39,6 +40,7 @@ class DataPageSearchTests(unittest.TestCase):
         conn.row_factory = sqlite3.Row
         self.addCleanup(conn.close)
         conn.executescript('''
+            CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT);
             CREATE TABLE products(id INTEGER PRIMARY KEY,model TEXT,product_name TEXT,
                 display_name TEXT,option_name TEXT,option_id TEXT,registered_product_id TEXT,
                 exposed_product_id TEXT,seller_product_item_id TEXT,fulfillment_type TEXT,
@@ -55,6 +57,7 @@ class DataPageSearchTests(unittest.TestCase):
                 product_name TEXT,registered_product_id TEXT,method TEXT,first_seen TEXT,last_seen TEXT);
             CREATE TABLE sales_pending(id INTEGER PRIMARY KEY);
         ''')
+        rocket_sales.ensure_schema(conn)
         self.conn = conn
         db = SimpleNamespace(conn=conn, query=lambda sql, args=(): conn.execute(sql, args).fetchall(),
             one=lambda sql, args=(): conn.execute(sql, args).fetchone(),
@@ -69,7 +72,7 @@ class DataPageSearchTests(unittest.TestCase):
             multitap_only_enabled=Mock(return_value=False), visible_models=Mock(return_value=['MODEL-A']),
             _multitap_product_clause=lambda alias: f"{alias}.model='MODEL-A'",
             _resolved_product_link=lambda row: '')
-        scope = dict(product_search=product_search, rocket_sales=rocket_sales, money=str, window_tools=window_tools)
+        scope = dict(product_search=product_search, rocket_sales=rocket_sales, money=str, window_tools=window_tools, timedelta=timedelta)
         methods = [n for n in APP.body if isinstance(n, ast.FunctionDef) and n.name in NAMES]
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(SOURCE), 'exec'), scope)
         for name in NAMES:

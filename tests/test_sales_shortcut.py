@@ -56,7 +56,12 @@ class DailySalesShortcutTests(unittest.TestCase):
             self.app.sync_recent_daily_sales()
         clock.assert_called_once_with()
         self.app.api_sync_all.assert_called_once_with(scope='로켓그로스 일일 매출만',
-            sales_from='2026-09-29', sales_to='2026-10-28')
+            sales_from='2026-09-29', sales_to='2026-10-28', sales_force=False)
+
+    def test_explicit_full_refresh_is_forwarded(self):
+        self.app.api_sync_all = Mock()
+        self.app.sync_recent_daily_sales(force=True)
+        self.assertTrue(self.app.api_sync_all.call_args.kwargs['sales_force'])
 
     def test_shortcut_recomputes_dates_on_each_click_across_midnight(self):
         self.app.api_sync_all = Mock()
@@ -77,13 +82,15 @@ class DailySalesShortcutTests(unittest.TestCase):
         self.db.conn.commit.assert_called_once_with()
         self.assertTrue(self.app.api_busy)
         target = self.threading.Thread.call_args.kwargs['target']
-        orders = [object()]
         saved = {'inserted': 1, 'updated': 0, 'unchanged': 0, 'conflicts': 0, 'unmapped': 0, 'orders': 1}
-        with patch.object(rocket_sales, 'fetch_orders', return_value=orders) as fetch, \
-             patch.object(rocket_sales, 'save_orders', return_value=saved) as save:
+        def collect(*args, **kwargs):
+            kwargs['on_saved']('2026-10-28')
+            return saved
+        with patch.object(rocket_sales, 'collect_orders', side_effect=collect) as collector:
             target()
-        fetch.assert_called_once_with(self.api, '2026-09-29', '2026-10-28', self.api.progress)
-        save.assert_called_once_with(self.worker_db.conn, 'TEST-VENDOR', orders, '2026-09-29', '2026-10-28')
+        args = collector.call_args.args
+        self.assertEqual(args[:4], (self.worker_db.conn, self.api, '2026-09-29', '2026-10-28'))
+        self.assertFalse(collector.call_args.kwargs['force'])
         self.globals['rocket_inventory'].fetch_inventory.assert_not_called()
         self.app._sync_product_data.assert_not_called()
         self.worker_db.close.assert_called_once_with()

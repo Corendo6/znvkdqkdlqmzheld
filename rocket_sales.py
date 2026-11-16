@@ -37,6 +37,18 @@ def ensure_schema(conn):
     conn.execute('''CREATE TABLE IF NOT EXISTS rg_sales_coverage(
         vendor_id TEXT NOT NULL, sale_date TEXT NOT NULL, fetched_at TEXT NOT NULL,
         PRIMARY KEY(vendor_id,sale_date))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS rg_sales_legacy_coverage(
+        vendor_id TEXT NOT NULL, sale_date TEXT NOT NULL, fetched_at TEXT NOT NULL,
+        PRIMARY KEY(vendor_id,sale_date))''')
+    coverage_version = conn.execute("SELECT value FROM settings WHERE key='rg_orders_coverage_version'").fetchone()
+    if not coverage_version:
+        # Pre-v0.4.21 date bounds omitted part of each Korean payment day.
+        # Old checkpoints have no per-date provenance, so preserve the ledger
+        # while requiring one verified fetch before calling those dates complete.
+        if had_coverage:
+            conn.execute('INSERT OR REPLACE INTO rg_sales_legacy_coverage SELECT * FROM rg_sales_coverage')
+            conn.execute('DELETE FROM rg_sales_coverage')
+        conn.execute("INSERT INTO settings(key,value) VALUES ('rg_orders_coverage_version','1')")
     if not had_coverage:
         # Older versions retained only the most recent successful query range.
         # Do not infer coverage from dates containing orders: empty days matter.
@@ -53,7 +65,10 @@ def ensure_schema(conn):
             except (ValueError, TypeError):
                 continue
             if vendor and 0 <= (last - first).days < 30:
-                _save_coverage(conn, vendor, first, last, stamp)
+                target = 'rg_sales_coverage' if coverage_version else 'rg_sales_legacy_coverage'
+                conn.executemany(f'INSERT OR REPLACE INTO {target} VALUES (?,?,?)',
+                                 [(vendor, (first + timedelta(days=i)).isoformat(), stamp)
+                                  for i in range((last - first).days + 1)])
 
 
 def _save_coverage(conn, vendor, first, last, stamp):
@@ -63,14 +78,53 @@ def _save_coverage(conn, vendor, first, last, stamp):
          for i in range((last - first).days + 1)])
 
 
+def _fetched_time(value):
+    try:
+        stamp = datetime.fromisoformat(value)
+        return (stamp.replace(tzinfo=KST) if stamp.tzinfo is None else stamp).astimezone(KST)
+    except (TypeError, ValueError):
+        return None
+
+
+def coverage_status(conn, vendor, start, end):
+    """Read explicit successful date checkpoints, including complete zero-order days."""
+    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    if not 0 <= (last - first).days < 30:
+        raise ValueError('수집 상태 조회 기간은 1~30일로 지정하세요.')
+    days = [(first + timedelta(days=i)).isoformat() for i in range((last - first).days + 1)]
+    stamps = dict(conn.execute('''SELECT sale_date,fetched_at FROM rg_sales_coverage
+        WHERE vendor_id=? AND sale_date BETWEEN ? AND ?''', (vendor, start, end)))
+    completed = [day for day in days if day in stamps]
+    missing = [day for day in days if day not in stamps]
+    legacy = {row[0] for row in conn.execute('''SELECT sale_date FROM rg_sales_legacy_coverage
+        WHERE vendor_id=? AND sale_date BETWEEN ? AND ?''', (vendor, start, end))}
+    times = [stamp for value in stamps.values() if (stamp := _fetched_time(value)) is not None]
+    return dict(completed_dates=completed, missing_dates=missing, fetched_at_by_date=stamps,
+                unverified_dates=[day for day in missing if day in legacy],
+                never_collected_dates=[day for day in missing if day not in legacy],
+                latest_fetched_at=max(times).isoformat(timespec='seconds') if times else '',
+                oldest_fetched_at=min(times).isoformat(timespec='seconds') if times else '',
+                total=len(days), count=len(completed), complete=not missing)
+
+
+def coverage_label(status):
+    label = f"수집 {status['count']}/{status['total']}일"
+    if status['missing_dates']:
+        label += f" · 미수집 {len(status['never_collected_dates'])}일"
+    if status['unverified_dates']:
+        label += f" · 이전 기록 재확인 {len(status['unverified_dates'])}일"
+    stamp = status['latest_fetched_at']
+    return label + (' · 최근 저장 ' + stamp.replace('T', ' ')[:19] + ' (한국시간)' if stamp else
+                    ' · 새 기준 수집 전' if status['unverified_dates'] else ' · 저장 기록 없음')
+
+
 def daily_quantities(conn, vendor, today=None):
     """API-only quantities by option, through yesterday KST; incomplete windows are unknown."""
     today = today or today_kst()
     last = (today - timedelta(days=1)).isoformat()
     starts = {n: (today - timedelta(days=n)).isoformat() for n in (1, 7, 30)}
-    covered = [r[0] for r in conn.execute('''SELECT sale_date FROM rg_sales_coverage
-        WHERE vendor_id=? AND sale_date BETWEEN ? AND ?''', (vendor, starts[30], last))]
-    coverage = {n: sum(day >= start for day in covered) for n, start in starts.items()}
+    status = {n: coverage_status(conn, vendor, start, last) for n, start in starts.items()}
+    coverage = {n: state['count'] for n, state in status.items()}
     metrics = {'yesterday': 1, 'last7': 7, 'sales_30': 30}
     empty = {key: 0 if coverage[n] == n else None for key, n in metrics.items()}
     by_option = {}
@@ -79,7 +133,7 @@ def daily_quantities(conn, vendor, today=None):
         for key, n in metrics.items():
             if totals[key] is not None and day >= starts[n]:
                 totals[key] += group['quantity']
-    return dict(by_option=by_option, coverage=coverage, empty=empty)
+    return dict(by_option=by_option, coverage=coverage, empty=empty, status=status)
 
 
 def _id(value, name):
@@ -363,7 +417,7 @@ def rebuild_sales(conn, vendor, start=None, end=None, option_ids=None):
     return result
 
 
-def save_orders(conn, vendor, orders, start, end):
+def save_orders(conn, vendor, orders, start, end, *, clear_error=True, remaining_dates=None):
     """Commit only after every page succeeds. Repeated queries replace the same orders."""
     first, last = validate_period(start, end)
     stamp = datetime.now(KST).isoformat(timespec='seconds')
@@ -384,15 +438,121 @@ def save_orders(conn, vendor, orders, start, end):
         result = rebuild_sales(conn, vendor, min(affected), max(affected))
         _save_coverage(conn, vendor, first, last, stamp)
         result['orders'] = len(orders)
-        for key, value in [('last_sync', stamp), ('last_from', start), ('last_to', end), ('last_error', '')]:
+        settings = [('last_sync', stamp), ('last_from', start), ('last_to', end)]
+        if clear_error:
+            settings.append(('last_error', ''))
+        if remaining_dates is not None:
+            settings.append(('remaining_dates', ','.join(remaining_dates)))
+        for key, value in settings:
             conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)', ('rg_orders_' + key + ':' + vendor, value))
         conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
                      ('rg_orders_last_result:' + vendor, summary(result)))
     return result
 
 
+class CollectionError(RuntimeError):
+    """A failed date, with already committed dates and the original error intact."""
+
+    def __init__(self, failed_date, result, cause):
+        self.failed_date, self.result, self.cause = failed_date, result, cause
+        super().__init__(f"{failed_date} 수집 중단 · 이번 실행 {len(result['completed_dates'])}일 저장"
+                         f" · 남은 조회 {len(result['remaining_dates'])}일 · {cause}")
+
+
+def collect_orders(conn, api, start, end, progress=None, force=False, on_saved=None):
+    """Checkpoint complete KST days; resume gaps before refreshing recent shipped orders.
+
+    A date is saved only after all pages and canonical order details succeed.
+    Recent seven days remain provisional and refresh once per Korean calendar
+    day. An explicit force request refreshes even already-covered dates.
+    This function owns commits, so callers must finish other transactions first.
+    """
+    first, last = validate_period(start, end)
+    if conn.in_transaction:
+        raise ValueError('일일 매출 수집 전에 진행 중인 저장 작업을 완료하세요.')
+    vendor = str(api.vendor_id or '').strip()
+    if not vendor:
+        raise ValueError('일일 매출을 조회할 판매자 ID가 없습니다.')
+    initial = coverage_status(conn, vendor, start, end)
+    pending_row = conn.execute('SELECT value FROM settings WHERE key=?',
+                               ('rg_orders_remaining_dates:' + vendor,)).fetchone()
+    pending = set()
+    for value in (pending_row[0] if pending_row else '').split(','):
+        try:
+            pending.add(date.fromisoformat(value).isoformat())
+        except ValueError:
+            pass
+    outside_pending = sorted(day for day in pending if not start <= day <= end)
+    today = today_kst()
+    recent_start = (today - timedelta(days=7)).isoformat()
+    missing = sorted(initial['missing_dates'], reverse=True)
+    refresh = []
+    for day in reversed(initial['completed_dates']):
+        fetched = _fetched_time(initial['fetched_at_by_date'][day])
+        if force or day in pending or (day >= recent_start and (fetched is None or fetched.date() < today)):
+            refresh.append(day)
+    planned = missing + refresh
+    result = dict(orders=0, inserted=0, updated=0, unchanged=0, conflicts=0, unmapped=0,
+                  completed_dates=[], skipped_dates=[day for day in initial['completed_dates'] if day not in refresh],
+                  remaining_dates=list(planned), coverage=initial)
+    with conn:
+        conn.executemany('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)', [
+            ('rg_orders_last_request_from:' + vendor, start),
+            ('rg_orders_last_request_to:' + vendor, end),
+            ('rg_orders_remaining_dates:' + vendor, ','.join(outside_pending + planned))])
+    for index, day in enumerate(planned):
+        try:
+            api.check_cancelled()
+            if str(api.vendor_id or '').strip() != vendor:
+                raise ValueError('수집 중 판매자 ID가 변경되었습니다. 다시 조회하세요.')
+            if progress:
+                progress(f'일일 매출 {day} · {index + 1}/{len(planned)}일 조회'
+                         f" · {len(result['completed_dates'])}일 저장 완료")
+            orders = fetch_orders(api, day, day, progress)
+            api.check_cancelled()
+            if str(api.vendor_id or '').strip() != vendor:
+                raise ValueError('수집 중 판매자 ID가 변경되었습니다. 다시 조회하세요.')
+            saved = save_orders(conn, vendor, orders, day, day, clear_error=False,
+                                remaining_dates=outside_pending + planned[index + 1:])
+        except Exception as cause:
+            result['coverage'] = coverage_status(conn, vendor, start, end)
+            error = CollectionError(day, result, cause)
+            try:
+                with conn:
+                    conn.executemany('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)', [
+                        ('rg_orders_last_error:' + vendor, str(error)[:2000]),
+                        ('rg_orders_failed_date:' + vendor, day),
+                        ('rg_orders_remaining_dates:' + vendor, ','.join(outside_pending + result['remaining_dates'])),
+                        ('rg_orders_last_result:' + vendor, summary(result))])
+            except Exception:
+                # A locked/full database must not hide the original fetch/save error.
+                pass
+            raise error from cause
+        for key in ('orders', 'inserted', 'updated', 'unchanged', 'conflicts', 'unmapped'):
+            result[key] += saved[key]
+        result['completed_dates'].append(day)
+        result['remaining_dates'] = planned[index + 1:]
+        if on_saved:
+            on_saved(day)
+    result['coverage'] = coverage_status(conn, vendor, start, end)
+    pending_error = (f'이전 수집의 미완료 날짜 {len(outside_pending)}일 · 해당 기간을 조회하면 이어받습니다.'
+                     if outside_pending else '')
+    with conn:
+        conn.executemany('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)', [
+            ('rg_orders_last_error:' + vendor, pending_error),
+            ('rg_orders_failed_date:' + vendor, outside_pending[0] if outside_pending else ''),
+            ('rg_orders_remaining_dates:' + vendor, ','.join(outside_pending)),
+            ('rg_orders_last_result:' + vendor, summary(result))])
+    return result
+
+
 def summary(result):
-    prefix = f"주문 {result['orders']:,}건 수집 · " if 'orders' in result else ''
+    prefix = ''
+    if 'completed_dates' in result:
+        prefix = (f"이번 실행 {len(result['completed_dates'])}일 저장"
+                  f" · 기존 수집 {len(result['skipped_dates'])}일 재사용"
+                  f" · 남은 조회 {len(result['remaining_dates'])}일 · ")
+    prefix += f"주문 {result['orders']:,}건 수집 · " if 'orders' in result else ''
     return (prefix + f"일별 옵션 매출 추가 {result['inserted']} / 갱신 {result['updated']} / 동일 {result['unchanged']}"
             f" · 기존 기록 우선 {result['conflicts']} · 모델 미연결 {result['unmapped']}")
 

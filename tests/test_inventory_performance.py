@@ -1,5 +1,6 @@
 """Exercise active-view rendering and selection with synthetic data and no network."""
 import sys
+import sqlite3
 import tkinter as tk
 import unittest
 from pathlib import Path
@@ -20,12 +21,18 @@ class InventoryRenderingTests(unittest.TestCase):
         self.callback_errors = []
         self.root.report_callback_exception = lambda *args: self.callback_errors.append(args)
         self.settings = {}
+        self.conn = sqlite3.connect(':memory:')
+        self.conn.execute('CREATE TABLE rg_sales_coverage(vendor_id TEXT, sale_date TEXT, fetched_at TEXT)')
+        self.conn.execute('CREATE TABLE rg_sales_legacy_coverage(vendor_id TEXT, sale_date TEXT, fetched_at TEXT)')
+        self.addCleanup(self.conn.close)
         self.thumbnails = SimpleNamespace(get=Mock(return_value=None),
                                           drain=Mock(return_value=set()), failed={})
         app = SimpleNamespace(db=SimpleNamespace(
+            conn=self.conn,
             setting=lambda key, default='': self.settings.get(key, default),
             set_setting=lambda key, value: self.settings.update({key: value})),
-            rg_thumbnails=self.thumbnails, open_search_dialog=lambda: None)
+            rg_thumbnails=self.thumbnails, open_search_dialog=lambda: None,
+            show_sales_collection_status=lambda: None)
         self.rows = [dict(key=str(i), option_id=str(i), product_name=f'상품 {i:03}',
             option_name='화이트 3구', model='HMP35L', image_url=f'https://test.invalid/{i}.png',
             search_text=f'상품 {i:03}', state='품절 임박' if i == 0 else '양호',

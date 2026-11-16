@@ -35,7 +35,7 @@ import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.22"
+VERSION = "0.4.23"
 
 
 def resource_path(*parts):
@@ -3323,11 +3323,14 @@ class CoupangManager(tk.Tk):
     def build_sales(self):
         self.page_header("일일 매출", "로켓그로스 주문을 조회해 결제일(한국시간)·옵션별 판매수량과 매출을 저장합니다.")
         sync_bar=ttk.Frame(self.content); sync_bar.pack(fill='x',pady=(0,8))
-        self.sales_api_sync_button=ttk.Button(sync_bar,text='최근 30일 API 조회·저장',style='Accent.TButton',command=self.sync_recent_daily_sales)
+        self.sales_api_sync_button=ttk.Button(sync_bar,text='최근 30일 이어받기',style='Accent.TButton',command=self.sync_recent_daily_sales)
         self.sales_api_sync_button.pack(side='left')
+        self.sales_api_full_button=ttk.Button(sync_bar,text='30일 전체 재조회',command=lambda:self.sync_recent_daily_sales(force=True))
+        self.sales_api_full_button.pack(side='left',padx=6)
+        ttk.Button(sync_bar,text='수집 상태',command=self.show_sales_collection_status).pack(side='left')
         self.sales_api_cancel_button=ttk.Button(sync_bar,text='조회 취소',command=self.api_cancel_sync)
         self.sales_api_cancel_button.pack(side='left',padx=6)
-        ttk.Label(sync_bar,text='어제까지 조회 · 재조회해도 중복 합산하지 않습니다.',foreground='#666').pack(side='left',padx=6)
+        ttk.Label(sync_bar,text='누락일 우선 · 최근 7일은 하루 한 번 보충 · 날짜별 저장',foreground='#666').pack(side='left',padx=6)
         ttk.Label(self.content,text='주문 API: 출고분·잠정 금액(판매수량 × 단가) · 취소/반품 차감 순매출과 다를 수 있습니다.',foreground='#795200').pack(anchor='w',pady=(0,4))
         self.sales_api_status=ttk.Label(self.content,text='',foreground='#666',wraplength=1100)
         self.sales_api_status.pack(anchor='w',pady=(0,8))
@@ -3354,11 +3357,44 @@ class CoupangManager(tk.Tk):
         self.refresh_sales()
         self._update_api_controls()
 
-    def sync_recent_daily_sales(self):
+    def sync_recent_daily_sales(self, force=False):
         today=rocket_sales.today_kst()
         self.api_sync_all(scope='로켓그로스 일일 매출만',
                           sales_from=(today-timedelta(days=30)).isoformat(),
-                          sales_to=(today-timedelta(days=1)).isoformat())
+                          sales_to=(today-timedelta(days=1)).isoformat(), sales_force=force)
+
+    def show_sales_collection_status(self):
+        """Read-only, independent snapshot; refresh uses the captured vendor."""
+        vendor=self.db.setting('api_vendor_id','').strip()
+        win=tk.Toplevel(self); win.title('일일 매출 수집 상태'); win.geometry('780x640')
+        win.minsize(680,420)
+        frame=ttk.Frame(win,padding=14); frame.pack(fill='both',expand=True)
+        ttk.Label(frame,text='최근 30일 · 한국시간 결제일 기준',font=('맑은 고딕',12,'bold')).pack(anchor='w')
+        ttk.Label(frame,text='수집 완료는 해당 날짜의 모든 페이지를 저장했다는 뜻입니다. 출고 기준 잠정치이며 확정 매출은 아닙니다.',wraplength=740).pack(anchor='w',pady=(5,8))
+        info=ttk.Label(frame,text='',wraplength=740); info.pack(anchor='w',pady=(0,8))
+        buttons=ttk.Frame(frame); buttons.pack(side='bottom',fill='x',pady=(8,0))
+        tree_frame=ttk.Frame(frame); tree_frame.pack(fill='both',expand=True)
+        tree=ttk.Treeview(tree_frame,columns=('day','state','stamp'),show='headings',height=20)
+        for key,title,width in [('day','결제일',130),('state','수집 상태',160),('stamp','마지막 저장 (한국시간)',280)]:
+            tree.heading(key,text=title); tree.column(key,width=width,anchor='w')
+        scrollbar=ttk.Scrollbar(tree_frame,orient='vertical',command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set); scrollbar.pack(side='right',fill='y'); tree.pack(fill='both',expand=True)
+        tree.tag_configure('missing',foreground='#b45309')
+        def refresh():
+            today=rocket_sales.today_kst()
+            first,last=today-timedelta(days=30),today-timedelta(days=1)
+            state=rocket_sales.coverage_status(self.db.conn,vendor,first.isoformat(),last.isoformat())
+            info.configure(text=rocket_sales.coverage_label(state))
+            tree.delete(*tree.get_children())
+            for offset in range(30):
+                day=(last-timedelta(days=offset)).isoformat()
+                stamp=state['fetched_at_by_date'].get(day)
+                label='수집 완료 · 잠정' if stamp else '이전 기록 · 재확인 필요' if day in state['unverified_dates'] else '미수집'
+                tree.insert('', 'end',values=(day,label,
+                    stamp[:19].replace('T',' ') if stamp else '—'),tags=() if stamp else ('missing',))
+        ttk.Button(buttons,text='상태 새로고침',command=refresh).pack(side='left')
+        ttk.Button(buttons,text='닫기',command=win.destroy).pack(side='right')
+        refresh(); self.after_idle(lambda:window_tools.place(win,self))
 
     def add_sale(self):
         v=self.sale_vars
@@ -3403,8 +3439,9 @@ class CoupangManager(tk.Tk):
         self.sales_tree.delete(*self.sales_tree.get_children())
         for r in rows:
             self.sales_tree.insert('', 'end',iid=str(r['id']),values=(r['id'],r['sale_date'],r['model'] or '모델 연결 필요',r['option_id'] or '',r['option_name'] or '',r['method'],money(r['revenue']),money(r['orders']),money(r['quantity']),rocket_sales.source_label(r['source'])))
-        stamp=self.db.setting('rg_orders_last_sync:'+vendor,'')
-        status=('마지막 주문 조회: '+stamp[:19].replace('T',' ')+' (한국시간) · '+self.db.setting('rg_orders_last_result:'+vendor,'')) if stamp else '주문 API 조회 전 · 위의 최근 30일 API 조회·저장 버튼을 누르세요.'
+        today=rocket_sales.today_kst()
+        state=rocket_sales.coverage_status(self.db.conn,vendor,(today-timedelta(days=30)).isoformat(),(today-timedelta(days=1)).isoformat())
+        status=rocket_sales.coverage_label(state)+' · 날짜별 내역은 수집 상태에서 확인하세요.'
         missing=self.db.one("SELECT COUNT(*) n FROM sales WHERE source=? AND COALESCE(model,'')=''",(api_source,))['n']
         if missing:
             status+=f' · 모델 미연결 {missing}건은 함께 표시합니다. 마스터 데이터 > 모델·옵션 매핑에서 연결하세요.'
@@ -3750,6 +3787,8 @@ class CoupangManager(tk.Tk):
         ttk.Button(period,text='최근 7일',command=lambda:set_period(7)).pack(side='left')
         ttk.Button(period,text='최근 30일',command=lambda:set_period(30)).pack(side='left',padx=(4,0))
         ttk.Label(period,text=' YYYY-MM-DD · 최대 30일',foreground='#666').pack(side='left')
+        self.api_sales_force=tk.BooleanVar(value=False)
+        ttk.Checkbutton(period,text='완료일도 재조회',variable=self.api_sales_force).pack(side='left',padx=8)
         buttons=ttk.Frame(api); buttons.grid(row=4,column=0,columnspan=4,sticky='w',pady=(4,8))
         self.api_save_button=ttk.Button(buttons,text='API 설정 저장',command=self.save_api_settings)
         self.api_save_button.pack(side='left')
@@ -3761,7 +3800,7 @@ class CoupangManager(tk.Tk):
         self.api_progress.grid(row=5,column=0,columnspan=4,sticky='ew',pady=5)
         ttk.Label(api,textvariable=self.api_status_var,foreground='#245',wraplength=880).grid(row=6,column=0,columnspan=4,sticky='w',pady=(5,8))
         ttk.Label(api,text='전체: 재고 → 일일 매출 → 상품정보·판매상태. 시작 시·주기적 자동 요청은 하지 않습니다.',foreground='#666').grid(row=7,column=0,columnspan=4,sticky='w')
-        ttk.Label(api,text='주문은 한국시간 기준 어제까지 조회합니다. 재고 화면의 어제·7일은 출고 주문 잠정치, 30일은 재고 API 제공값입니다. 재조회로 늦게 출고된 주문을 보충합니다.',foreground='#666',wraplength=880).grid(row=8,column=0,columnspan=4,sticky='w',pady=(5,0))
+        ttk.Label(api,text='매출은 날짜별 저장 후 누락일부터 이어받습니다. 최근 7일은 하루 한 번 다시 확인합니다. 더 오래된 주문의 변경은 완료일도 재조회로 보충하세요. 어제·7일은 출고 잠정치, 30일은 재고 API 제공값입니다.',foreground='#666',wraplength=880).grid(row=8,column=0,columnspan=4,sticky='w',pady=(5,0))
         self._update_api_controls()
 
         info=ttk.LabelFrame(self.data_general,text='저장 위치',padding=14);info.pack(fill='x',pady=(0,12))
@@ -3879,16 +3918,16 @@ class CoupangManager(tk.Tk):
             text += f' · 경과 {elapsed}초'
         self.api_status_var.set(text[:500])
         page = getattr(self, 'rocket_inventory_page', None)
-        if getattr(self, 'current_page', '') == 'rocket_inventory' and page and page.winfo_exists():
+        if self.api_busy and getattr(self, 'current_page', '') == 'rocket_inventory' and page and page.winfo_exists():
             page.set_status(text[:280])
         status = getattr(self, 'sales_api_status', None)
-        if getattr(self, 'current_page', '') == 'sales' and status and status.winfo_exists():
+        if self.api_busy and getattr(self, 'current_page', '') == 'sales' and status and status.winfo_exists():
             status.configure(text=text[:500])
 
     def _update_api_controls(self):
         controls = [('api_sync_button', not self.api_busy), ('api_cancel_button', self.api_busy),
                     ('api_save_button', not self.api_busy), ('sales_api_sync_button', not self.api_busy),
-                    ('sales_api_cancel_button', self.api_busy)]
+                    ('sales_api_cancel_button', self.api_busy), ('sales_api_full_button', not self.api_busy)]
         for name, enabled in controls:
             widget = getattr(self, name, None)
             if widget is not None and widget.winfo_exists():
@@ -3905,7 +3944,7 @@ class CoupangManager(tk.Tk):
             self.api_cancel_event.set()
             self._set_api_status('취소 요청됨 · 진행 중인 네트워크 요청이 끝나면 중단합니다')
 
-    def api_sync_all(self, scope=None, sales_from=None, sales_to=None):
+    def api_sync_all(self, scope=None, sales_from=None, sales_to=None, sales_force=None):
         """The only UI entry point for API requests; one worker owns the whole run."""
         if self.api_busy:
             return
@@ -3923,6 +3962,8 @@ class CoupangManager(tk.Tk):
             return
         sales_from=sales_from if sales_from is not None else self.api_sales_from.get().strip()
         sales_to=sales_to if sales_to is not None else self.api_sales_to.get().strip()
+        if sales_force is None:
+            sales_force=bool(self.api_sales_force.get()) if hasattr(self,'api_sales_force') else False
         if do_orders:
             try: rocket_sales.validate_period(sales_from,sales_to)
             except ValueError as exc:
@@ -3964,19 +4005,27 @@ class CoupangManager(tk.Tk):
                 if do_orders:
                     try:
                         api.progress(f'로켓그로스 일일 매출 조회 {sales_from} ~ {sales_to}')
-                        orders=rocket_sales.fetch_orders(api,sales_from,sales_to,api.progress)
-                        api.check_cancelled()
-                        saved=rocket_sales.save_orders(db2.conn,vendor,orders,sales_from,sales_to)
+                        saved=rocket_sales.collect_orders(db2.conn,api,sales_from,sales_to,api.progress,
+                            force=sales_force,on_saved=lambda *args:self.api_queue.put(('orders_saved',)))
                         results['orders']={'ok':True,'text':rocket_sales.summary(saved)}
                         LOGGER.info('로켓그로스 일일 매출 저장 기간=%s~%s 결과=%s',sales_from,sales_to,saved)
                         self.api_queue.put(('orders_saved',))
+                    except rocket_sales.CollectionError as exc:
+                        saved=exc.result
+                        text=rocket_sales.summary(saved)+' · '+str(exc)
+                        results['orders']={'ok':False,'text':text}
+                        self.api_queue.put(('orders_saved',))
+                        if isinstance(exc.cause,CoupangAPICancelled):
+                            raise exc.cause
+                        LOGGER.warning('일일 매출 일부 저장 후 중단: %s',exc)
+                        api.progress(text)
                     except CoupangAPICancelled:
                         raise
                     except Exception as exc:
                         LOGGER.exception('통합 갱신: 로켓그로스 일일 매출 실패')
                         db2.set_setting('rg_orders_last_error:'+vendor,str(exc)[:2000])
                         results['orders']={'ok':False,'text':'일일 매출 실패: '+str(exc)[:350]}
-                        api.progress('일일 매출 조회 실패 · 이전 매출 유지')
+                        api.progress('일일 매출 조회 중단 · 완료된 날짜는 저장되어 있습니다')
                 api.check_cancelled()
                 if do_products:
                     try:
@@ -4061,7 +4110,7 @@ class CoupangManager(tk.Tk):
                 LOGGER.exception('API 완료 후 화면 갱신 실패')
             self._set_api_status(title+' · '+' / '.join(parts))
             if cancelled:
-                detail += '\n이미 완료된 단계의 결과는 저장되어 있습니다.'
+                detail += '\n이미 완료된 단계와 매출 날짜는 저장되어 있습니다. 이어받기로 남은 날짜를 조회할 수 있습니다.'
             if failures:
                 messagebox.showwarning(title, detail+'\n\n실패한 조회의 이전 자료를 유지합니다. 상세 사유는 실행 / API 로그에서 확인하세요.')
             else:

@@ -88,12 +88,13 @@ class SyncQueryIntegrationTests(unittest.TestCase):
         self.fetch_inventory = patch.object(rocket_inventory, 'fetch_inventory', return_value=self.inventory)
         self.inv_mock = self.fetch_inventory.start()
         self.addCleanup(self.fetch_inventory.stop)
-        self.fetch_orders = patch.object(rocket_sales, 'fetch_orders', return_value=[self.order])
+        self.fetch_orders = patch.object(rocket_sales, 'fetch_orders',
+            side_effect=lambda api, start, end, *args: [self.order] if start <= self.last <= end else [])
         self.orders_mock = self.fetch_orders.start()
         self.addCleanup(self.fetch_orders.stop)
 
-    def run_sync(self, scope='전체 갱신'):
-        self.app.api_sync_all(scope=scope)
+    def run_sync(self, scope='전체 갱신', force=False):
+        self.app.api_sync_all(scope=scope, sales_force=force)
         events = []
         while not self.events.empty():
             events.append(self.events.get_nowait())
@@ -104,14 +105,16 @@ class SyncQueryIntegrationTests(unittest.TestCase):
     def test_order_failure_preserves_committed_stock_and_prior_sales(self):
         rocket_sales.save_orders(self.db.conn, VENDOR, [self.order], self.first, self.last)
         self.orders_mock.side_effect = ValueError('failed last order page')
-        events, results = self.run_sync()
+        events, results = self.run_sync(force=True)
         self.assertTrue(results['inventory']['ok'])
         self.assertFalse(results['orders']['ok'])
         self.assertTrue(results['products']['ok'])
         self.assertEqual(self.db.conn.execute('SELECT orderable_quantity FROM rg_inventory_snapshots').fetchone()[0], 17)
         self.assertEqual(self.db.conn.execute('SELECT quantity FROM rg_order_items').fetchone()[0], 3)
-        self.assertEqual(self.events.saved_transactions, [('inventory_saved', False)])
-        self.assertNotIn('orders_saved', [item[0] for item in events])
+        self.assertEqual(self.events.saved_transactions[0], ('inventory_saved', False))
+        self.assertTrue(all(not active for _, active in self.events.saved_transactions))
+        self.assertEqual(self.db.conn.execute('SELECT COUNT(*) FROM rg_sales_coverage').fetchone()[0], 30)
+        self.assertIn('failed last order page', self.db.setting('rg_orders_last_error:'+VENDOR))
 
     def test_product_failure_preserves_committed_orders_and_coverage(self):
         self.app._sync_product_data.side_effect = ValueError('product failed')
@@ -120,7 +123,9 @@ class SyncQueryIntegrationTests(unittest.TestCase):
         self.assertFalse(results['products']['ok'])
         self.assertEqual(self.db.conn.execute('SELECT COUNT(*) FROM rg_sales_coverage').fetchone()[0], 30)
         self.assertEqual(self.db.conn.execute('SELECT quantity FROM sales').fetchone()[0], 3)
-        self.assertEqual(self.events.saved_transactions, [('inventory_saved', False), ('orders_saved', False)])
+        self.assertEqual(self.events.saved_transactions[0], ('inventory_saved', False))
+        self.assertGreaterEqual(sum(kind == 'orders_saved' for kind, _ in self.events.saved_transactions), 30)
+        self.assertTrue(all(not active for _, active in self.events.saved_transactions))
         self.assertLess([e[0] for e in events].index('orders_saved'), [e[0] for e in events].index('sync_complete'))
 
     def test_cancel_after_stock_save_keeps_stock_and_does_not_start_orders(self):
@@ -149,7 +154,13 @@ class SyncQueryIntegrationTests(unittest.TestCase):
         with patch.object(rocket_sales, 'rebuild_sales', wraps=rocket_sales.rebuild_sales) as rebuild, \
              patch.object(rocket_sales, 'sales_status', side_effect=observe_status) as summary:
             _, results = self.run_sync()
-        self.assertEqual(rebuild.call_count, 2)  # Save selected orders, then relink all history.
+        # Each complete date rebuilds its totals; one final pass links the newly fetched products.
+        self.assertEqual(rebuild.call_count, 31)
+        daily_ranges = [call.args[2:] for call in rebuild.call_args_list[:-1]]
+        self.assertEqual({first for first, last in daily_ranges},
+                         {(TODAY-timedelta(days=i)).isoformat() for i in range(1, 31)})
+        self.assertTrue(all(first == last for first, last in daily_ranges))
+        self.assertEqual(rebuild.call_args_list[-1].args, (self.db.conn, VENDOR))
         summary.assert_called_once_with(self.db.conn, VENDOR, self.first, self.last)
         self.assertEqual(readonly_changes, [0])
         self.assertEqual(self.db.conn.execute('SELECT model FROM sales').fetchone()[0], 'MODEL')

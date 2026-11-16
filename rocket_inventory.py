@@ -262,7 +262,15 @@ def build_rows(app, now=None):
                          yesterday=history['yesterday'], last7=history['last7'],
                          order_yesterday=history['yesterday'], order_last7=history['last7'],
                          order_sales_30=history['sales_30'],
-                         sales_30_source='쿠팡 재고 API', recent_sales_source='출고 주문 · 잠정',
+                         sales_30_source='쿠팡 재고 API' if sales is not None else '미수집',
+                         recent_sales_source='출고 주문 · 잠정',
+                         yesterday_status=('재확인 필요' if daily['status'][1].get('unverified_dates') else '미수집') if history['yesterday'] is None else '잠정',
+                         last7_status=('재확인 필요' if daily['status'][7].get('unverified_dates') else '미수집') if history['last7'] is None else '잠정',
+                         sales_30_status='미수집' if sales is None else '쿠팡 제공',
+                         yesterday_fetched_at=daily['status'][1]['latest_fetched_at'],
+                         last7_fetched_at=daily['status'][7]['oldest_fetched_at'],
+                         sales_missing_dates=', '.join(daily['status'][30]['missing_dates']),
+                         sales_unverified_dates=', '.join(daily['status'][30].get('unverified_dates', [])),
                          recorded_days=daily['coverage'][7], sales_recorded_days=daily['coverage'][30],
                          gross=gross, estimated_cost=gross['estimated_cost'],
                          unit_cost=gross['cost'], logistics=gross['logistics'],
@@ -275,6 +283,11 @@ def build_rows(app, now=None):
 
 def format_number(value):
     return '—' if value is None else f'{value:,.0f}'
+
+
+def format_sales(value, status='미수집'):
+    """Unknown sales must be visibly distinct from a successfully collected zero."""
+    return status if value is None else format_number(value)
 
 
 def save_pending(conn, vendor, option_ids, quantity, pack=1, note=''):
@@ -456,13 +469,14 @@ class RocketInventoryPage(tk.Frame):
         view = ttk.Combobox(title, textvariable=self.view_mode, values=['기본 보기','엑셀형 보기'], state='readonly', width=12)
         view.pack(side='right', padx=8)
         view.bind('<<ComboboxSelected>>', self.change_view)
-        self.status_label = self.label(self, '재고 API 조회 전', color=MUTED, anchor='w')
+        self.status_label = self.label(self, '재고 API 조회 전', color=MUTED, anchor='w', justify='left')
         self.status_label.pack(fill='x', pady=(0, 14))
         summary = tk.Frame(self, bg='#f6f9fc', padx=14, pady=11)
         summary.pack(fill='x', pady=(0, 12))
         self.summary_label = self.label(summary, '', size=11, bold=True, anchor='w')
         self.summary_label.pack(side='left')
         self.button(summary, '항목 안내', self.show_help).pack(side='right')
+        self.button(summary, '판매량 수집 상태', self.app.show_sales_collection_status).pack(side='right', padx=8)
         toolbar = tk.Frame(self, bg=BG)
         toolbar.pack(fill='x', pady=(0, 10))
         self.button(toolbar, 'F5 검색', self.app.open_search_dialog).pack(side='left')
@@ -479,7 +493,7 @@ class RocketInventoryPage(tk.Frame):
         cb.bind('<<ComboboxSelected>>', lambda e: self.apply_filters())
         self.button(toolbar, 'CSV 저장', self.export_csv).pack(side='right')
         self.button(toolbar, '선택 입고중 입력', self.edit_selected).pack(side='right', padx=8)
-        self.label(self, '30일: 쿠팡 제공 판매량  ·  어제·7일: 출고 주문 기준 잠정 수량  ·  F5: 상품 / 옵션 ID 검색', color=MUTED, size=9, anchor='w').pack(fill='x', pady=(0, 6))
+        self.label(self, '30일: 쿠팡 제공  ·  어제·7일: 출고 주문 잠정 수량  ·  미수집/재확인 필요: 날짜별 수집 상태 확인  ·  F5: 검색', color=MUTED, size=9, anchor='w').pack(fill='x', pady=(0, 6))
         holder = tk.Frame(self, bg=BG, highlightthickness=1, highlightbackground=BORDER)
         self.holder = holder
         holder.grid_columnconfigure(0, weight=1)
@@ -584,7 +598,7 @@ class RocketInventoryPage(tk.Frame):
                 value=row.get(key)
                 if key=='sale_price': value=row['gross']['sale']
                 if key=='state' and urgent_stock(row): value='긴급 · '+value
-                values.append('—' if value is None else f'{value:.1f}' if key in ('days','margin_rate') else f'{value:+,.1f}' if key=='gap7' else format_number(value) if isinstance(value,(int,float)) else value)
+                values.append(format_sales(value, row.get(key+'_status', '미수집')) if key in ('yesterday','last7','sales_30') else '—' if value is None else f'{value:.1f}' if key in ('days','margin_rate') else f'{value:+,.1f}' if key=='gap7' else format_number(value) if isinstance(value,(int,float)) else value)
             self.sheet.insert('', 'end', iid=str(i),values=values,tags=('urgent',) if urgent_stock(row) else ('odd' if i%2 else 'even',))
         self.sheet.selection_set([str(i) for i,r in enumerate(self.visible_rows) if r['key'] in self.selected])
 
@@ -657,11 +671,25 @@ class RocketInventoryPage(tk.Frame):
         status = '재고·30일 판매량 조회: ' + (stamp.replace('T', ' ')[:19] + ' (한국시간)' if stamp else '아직 조회하지 않았습니다')
         if error:
             status += '  ·  최근 조회 실패 — 이전 결과 표시 중'
-        sales_stamp = self.app.db.setting('rg_orders_last_sync:' + vendor, '')
         sales_error = self.app.db.setting('rg_orders_last_error:' + vendor, '')
-        status += '\n어제·7일 출고 주문 조회: ' + (sales_stamp.replace('T', ' ')[:19] + ' (한국시간)' if sales_stamp else '조회 전 · 데이터·설정에서 최근 30일 조회')
+        today = rocket_sales.today_kst()
+        period = rocket_sales.coverage_status(self.app.db.conn, vendor,
+            (today-timedelta(days=30)).isoformat(), (today-timedelta(days=1)).isoformat())
+        covered = set(period['completed_dates'])
+        yesterday = (today-timedelta(days=1)).isoformat()
+        last7_count = sum(day >= (today-timedelta(days=7)).isoformat() for day in covered)
+        unverified = set(period.get('unverified_dates', []))
+        yesterday_state = '잠정' if yesterday in covered else '재확인 필요' if yesterday in unverified else '미수집'
+        week_unknown = '재확인 필요' if any(day >= (today-timedelta(days=7)).isoformat() for day in unverified) else '미수집'
+        week_state = '잠정' if last7_count == 7 else f'{week_unknown} ({last7_count}/7일 완료)'
+        status += f'\n출고 주문: 어제 {yesterday_state} · 7일 {week_state}  |  '+rocket_sales.coverage_label(period)
         if sales_error:
-            status += '  ·  최근 매출 조회 실패 — 이전 결과 표시 중'
+            status += '  ·  최근 수집 중단 · 완료 날짜는 저장됨'
+        if period['missing_dates']:
+            missing = period['missing_dates']
+            shown = ', '.join(day[5:] for day in missing[:4])
+            more = f' 외 {len(missing)-4}일' if len(missing)>4 else ''
+            status += '\n수집 필요: '+shown+more+'  ·  전체 날짜와 수집 시각은 [판매량 수집 상태]에서 확인'
         self.set_status(status)
         total = len(self.rows)
         good = sum(r['state'] == '양호' for r in self.rows)
@@ -852,10 +880,11 @@ class RocketInventoryPage(tk.Frame):
             self._text(c, left, y+offset, label, color=INK if bold else MUTED, size=9)
             self._text(c, right, y+offset-1, value, color=color or (INK if bold else '#526a85'),
                        size=10, bold=bold, anchor='ne')
-        metric(2, 20, '어제', format_number(r['yesterday']))
-        metric(2, 48, '7일', format_number(r['last7']))
-        metric(2, 76, '30일', format_number(r['sales_30']), True)
-        self._text(c, edges[2]+10, y+99, '어제·7일: 출고 잠정\n30일: 쿠팡 제공', color=MUTED, size=8)
+        metric(2, 20, '어제', format_sales(r['yesterday'], r.get('yesterday_status', '미수집')))
+        metric(2, 48, '7일', format_sales(r['last7'], r.get('last7_status', '미수집')))
+        metric(2, 76, '30일', format_sales(r['sales_30']), True)
+        direct_status = '미수집' if r['sales_30'] is None else '쿠팡 제공'
+        self._text(c, edges[2]+10, y+99, '어제·7일: 출고 잠정\n30일: '+direct_status, color=MUTED, size=8)
         metric(3, 20, '판매가능', format_number(r['stock']), True, color=RED if urgent_stock(r) else None)
         text = '소진 예상 —' if r['days'] is None else f'소진 예상 {r["days"]:.1f}일'
         self._text(c, edges[3]+10, y+45, text, color=RED if urgent_stock(r) else MUTED, size=8)
@@ -1129,11 +1158,13 @@ class RocketInventoryPage(tk.Frame):
             '  최근 판매가 있는 품절 상품과 미확인 수량은 그대로 표시합니다.\n'
             '• 판매가능: 로켓그로스 재고 API 응답입니다.\n'
             '• 30일: 재고 API가 직접 제공한 최근 30일 판매수량입니다.\n'
-            '  값이 없으면 —이며 주문 합계로 대체하지 않습니다. 쿠팡 화면과 조회 시각이 다를 수 있습니다.\n'
+            '  값이 없으면 미수집이며 주문 합계로 대체하지 않습니다. 쿠팡 화면과 조회 시각이 다를 수 있습니다.\n'
             '• 어제 / 7일: 출고 주문의 결제일 기준 잠정 수량이며 쿠팡 화면과 다를 수 있습니다.\n'
             '  한국시간 어제까지이며, 주문 건수나 매출액이 아닌 판매 개수입니다.\n'
-            '  기간 전체를 조회했으면 판매 없는 날은 0개, 미조회 날짜가 있으면 —입니다.\n'
-            '  데이터·설정 > API 갱신에서 최근 30일 매출을 조회하세요.\n'
+            '  기간 전체를 조회했으면 판매 없는 날은 0개, 미조회 날짜가 있으면 미수집입니다.\n'
+            '  이전 버전의 수집 완료 기록은 재확인 필요로 표시하며, 다시 수집하면 잠정 수량을 표시합니다.\n'
+            '  판매량 수집 상태에서 완료·누락 날짜와 마지막 수집 시간을 확인하세요.\n'
+            '  일일 매출 > 최근 30일 이어받기에서 누락 날짜를 수집하세요.\n'
             '  재조회 시 늦은 출고분을 보충합니다. 조회 완료일수는 판매 확정을 뜻하지 않습니다.\n'
             '  직접 입력·Excel 매출은 포함하지 않아 일일 매출 탭의 수정값과 다를 수 있습니다.\n'
             '• 입고중: 직접 입력합니다. 입고가 끝나면 남은 수량으로 수정하세요.\n'
@@ -1163,6 +1194,11 @@ class RocketInventoryPage(tk.Frame):
                    ('stock', '주문가능재고'), ('pending', '입고중_직접입력'), ('recommended', '권장추가입고_자체계산'),
                    ('pack', '입고단위'), ('sales_30', '30일판매수량_쿠팡재고API'), ('yesterday', '어제판매수량_출고주문_잠정'),
                    ('last7', '7일판매수량_출고주문_잠정'), ('gap7', '부족분_7일판매x2.5_재고입고중차감'),
+                   ('yesterday_status', '어제판매량_상태'), ('last7_status', '7일판매량_상태'),
+                   ('sales_30_status', '30일판매량_상태'),
+                   ('yesterday_fetched_at', '어제판매량_수집시각'), ('last7_fetched_at', '7일판매량_가장오래된수집시각'),
+                   ('sales_missing_dates', '출고주문_최근30일수집필요날짜'),
+                   ('sales_unverified_dates', '출고주문_이전기록재확인날짜'),
                    ('order_sales_30', '30일판매수량_출고주문_비교용'),
                    ('recorded_days', '출고주문_7일중조회완료일수'),
                    ('sales_recorded_days', '출고주문_30일중조회완료일수'), ('days', '소진예상일수'),
