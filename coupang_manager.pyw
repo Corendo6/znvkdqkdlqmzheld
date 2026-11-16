@@ -35,7 +35,7 @@ import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.23"
+VERSION = "0.4.24"
 
 
 def resource_path(*parts):
@@ -1070,6 +1070,7 @@ class CoupangManager(tk.Tk):
                     time.monotonic() - started)
         self._search_dialog = None
         self.bind('<F5>', self.open_search_dialog)
+        self.bind('<Escape>', self.clear_current_search)
         self.after(200, self._poll_api_queue)
         # Restore saved option mappings after the window is ready. Name-based
         # inference belongs to explicit repair/import/sync, never the UI startup.
@@ -1181,6 +1182,21 @@ class CoupangManager(tk.Tk):
         }
         variable, refresh = targets[page]
         return getattr(self, variable), refresh
+
+    def clear_current_search(self, event=None):
+        if self.grab_current() is not None:
+            return
+        if event is not None and event.widget.winfo_toplevel() is not self:
+            return
+        page = self.current_page
+        if page not in ('products', 'rocket_inventory', 'master', 'margin', 'sales', 'search'):
+            return
+        variable, refresh = self._search_target(page)
+        if variable.get() or self._search_field(page) != '전체':
+            self._set_search_field(page, '전체')
+            variable.set('')
+            refresh()
+        return 'break'
 
     def open_search_dialog(self, event=None):
         # Leave an already open edit/settings dialog in charge of its inputs.
