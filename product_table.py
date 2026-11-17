@@ -330,7 +330,7 @@ class ProductTable(tk.Canvas):
             self._text(bx+7, by, label, self.small, fg)
             if node['error']:
                 self._text(bx, y+height-10, '조회 오류', self.small, '#895710')
-            self._text(edges[6]+13, y+height/2-(8 if node['changed'] else 0), '상세 보기', self.small, self.BLUE)
+            self._text(edges[6]+13, y+height/2-(8 if node['changed'] else 0), '이력 확인', self.small, self.BLUE)
             if node['changed']:
                 self._text(edges[6]+13, y+height-12, '이력 변경', self.small, '#895710')
             for col in (3, 6):
@@ -417,7 +417,7 @@ class ProductTable(tk.Canvas):
                 self.item(self._focus_iid, open=self._focus_iid in self._closed)
             else:
                 self.selection_set(self._focus_iid)
-                self.app.show_product_details()
+                self.app.show_exposure_history()
         return 'break'
 
     def _select_all(self, event):

@@ -35,7 +35,7 @@ import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.24"
+VERSION = "0.4.25"
 
 
 def resource_path(*parts):
@@ -1841,8 +1841,8 @@ class CoupangManager(tk.Tk):
             ttk.Button(actions,text='모두 펼치기',command=lambda:self.set_all_product_groups(True)).pack(side='right')
             ttk.Button(actions,text='모두 접기',command=lambda:self.set_all_product_groups(False)).pack(side='right',padx=6)
             detail=ttk.LabelFrame(self.content,text='선택 옵션',padding=(10,6)); detail.pack(side='bottom',fill='x',pady=(6,0))
-            self.prod_detail_var=tk.StringVar(value='더블클릭 / Enter: 상세 보기 · 우클릭: 복사 / 상품 열기 / ID 이력')
-            ttk.Button(detail,text='상세 보기',command=self.show_product_details).pack(side='right',padx=(10,0))
+            self.prod_detail_var=tk.StringVar(value='더블클릭 / Enter: 이력 확인 · 우클릭: 복사 / 상품 열기 / ID 이력')
+            ttk.Button(detail,text='이력 확인',command=self.show_exposure_history).pack(side='right',padx=(10,0))
             detail_label=ttk.Label(detail,textvariable=self.prod_detail_var,anchor='w',justify='left',wraplength=680)
             detail_label.pack(side='left',fill='x',expand=True)
             detail_label.bind('<Configure>',lambda e:detail_label.configure(wraplength=max(200,e.width)))
@@ -2000,7 +2000,7 @@ class CoupangManager(tk.Tk):
                     table_rows.append({'iid':str(r['id']), 'text':option, 'model':str(r['model'] or ''),
                         'error':bool(str(r['sale_status_error'] or '').strip()), 'changed':len(history)>1,
                         'values':(fulfillment,status,money(r['sale_price']) if r['sale_price'] is not None else '—',
-                                  money(r['map_price']) if r['map_price'] else '—',stock,'상세 보기')})
+                                  money(r['map_price']) if r['map_price'] else '—',stock,'이력 확인')})
                 table_groups.append({'iid':'grp:'+key, 'text':name, 'meta':'  ·  '.join(meta), 'rows':table_rows})
             self.prod_tree.set_groups(table_groups)
         else:
@@ -2102,10 +2102,7 @@ class CoupangManager(tk.Tk):
             return
         self.prod_tree.selection_set(row)
         self.prod_tree.focus(row)
-        if key == 'history':
-            self.show_exposure_history()
-        else:
-            self.show_product_details()
+        self.show_exposure_history()
         return 'break'
 
     def product_tree_double_click(self,event=None):
@@ -2122,7 +2119,7 @@ class CoupangManager(tk.Tk):
             self.show_exposure_history(); return 'break'
         if isinstance(self.prod_tree, ProductTable):
             self.prod_tree.selection_set(iid)
-            self.show_product_details()
+            self.show_exposure_history()
         else:
             self.edit_product()
         return 'break'
@@ -2207,7 +2204,7 @@ class CoupangManager(tk.Tk):
         r=self.selected_product()
         if isinstance(getattr(self,'prod_tree',None), ProductTable):
             if not r:
-                self.prod_detail_var.set('더블클릭 / Enter: 상세 보기 · 우클릭: 복사 / 상품 열기 / ID 이력')
+                self.prod_detail_var.set('더블클릭 / Enter: 이력 확인 · 우클릭: 복사 / 상품 열기 / ID 이력')
             else:
                 summary=f"{r['fulfillment_type'] or '판매자배송'}  ·  {r['model'] or '모델 미연결'}  ·  {r['option_name'] or '-'}"
                 if r['sale_status_checked_at']: summary += f"\n상태 확인 {r['sale_status_checked_at']}"
