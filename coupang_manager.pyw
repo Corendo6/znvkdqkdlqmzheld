@@ -26,6 +26,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import api_query
+import revenue_exposure
+import exposure_lookup
 import rocket_inventory
 import rocket_sales
 import gross_margin
@@ -35,7 +37,7 @@ import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.25"
+VERSION = "0.4.26"
 
 
 def resource_path(*parts):
@@ -311,8 +313,7 @@ class CoupangAPI:
         page = 0
         while True:
             if next_token in seen:
-                LOGGER.warning("%s 목록 nextToken 반복 감지: %s", label, next_token)
-                break
+                raise CoupangAPIError(f"{label} 목록 페이지가 반복되었습니다.")
             seen.add(next_token)
             params = [("vendorId", self.vendor_id), ("nextToken", next_token), ("maxPerPage", 100)]
             if business_types:
@@ -321,7 +322,9 @@ class CoupangAPI:
             result = self._request("GET", self.PRODUCT_LIST_PATH, params)
             if str(result.get("code", "")).upper() not in ("SUCCESS", "200", ""):
                 raise CoupangAPIError(result.get("message") or f"{label} 목록 조회 실패")
-            rows = result.get("data") or []
+            rows = result.get("data")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise CoupangAPIError("상품 목록 응답 형식이 올바르지 않습니다.")
             all_rows.extend(rows)
             page += 1
             if progress:
@@ -359,111 +362,10 @@ class CoupangAPI:
         return data
 
     def get_revenue_exposure_map(self, vendor_item_ids, lookback_days=365, progress=None):
-        """Fallback resolver for vendorItemId -> productId from revenue history.
-
-        Product detail (/seller-products/{sellerProductId}) remains the primary
-        source. This method is called only for option rows whose exposed product ID
-        could not be resolved from product detail or trusted existing data.
-        Newest sale/payment date wins (recognition date is used only as a fallback).
-        """
-        targets={str(x or '').strip() for x in vendor_item_ids}
-        targets.discard('')
-        if not targets:
-            return {'latest':{}, 'history':{}, 'daysScanned':0, 'requests':0}
-
-        today=self._query_cache.day
-        end=today-timedelta(days=1)  # API permits through yesterday only.
-        floor=end-timedelta(days=max(1, int(lookback_days))-1)
-        unresolved=set(targets)
-        history={}  # vendorItemId -> productId -> most recent recognitionDate
-        request_count=0
-        cache_hits=0
-        scanned_days=0
-
-        while end >= floor and unresolved:
-            start=max(floor, end-timedelta(days=30))  # max 31 inclusive days
-            token=''
-            chunk_seen=set()
-            page=0
-            seen_tokens=set()
-            completed_pages={}
-            while True:
-                params=[
-                    ('vendorId', self.vendor_id),
-                    ('recognitionDateFrom', start.isoformat()),
-                    ('recognitionDateTo', end.isoformat()),
-                    ('token', token),
-                    ('maxPerPage', 50),
-                ]
-                self.check_cancelled()
-                cache_key=self._query_cache.key(self.vendor_id, 'GET', self.REVENUE_PATH, params)
-                result=self._query_cache.get(cache_key)
-                if result is None:
-                    result=self._request('GET', self.REVENUE_PATH, params, timeout=45)
-                    request_count += 1
-                else:
-                    cache_hits += 1
-                page += 1
-                if not isinstance(result, dict):
-                    raise CoupangAPIError('매출내역 응답 형식이 올바르지 않습니다.')
-                code=str(result.get('code','')).upper()
-                if code not in ('200','SUCCESS',''):
-                    raise CoupangAPIError(result.get('message') or '매출내역 조회 실패')
-                rows=result.get('data')
-                if not isinstance(rows, list) or any(not isinstance(sale, dict)
-                        or not isinstance(sale.get('items', []), list)
-                        or any(not isinstance(item, dict) for item in sale.get('items', []))
-                        for sale in rows):
-                    raise CoupangAPIError('매출내역 상품 목록의 응답 형식이 올바르지 않습니다.')
-                completed_pages[cache_key]=result
-                for sale in result.get('data') or []:
-                    # productId reflects the ordered item; use payment/sale date for
-                    # recency so a later refund recognition does not make an old mapping look current.
-                    seen_date=str(sale.get('saleDate') or sale.get('recognitionDate') or '')
-                    for item in sale.get('items') or []:
-                        vid=str(item.get('vendorItemId') or '').strip()
-                        pid=str(item.get('productId') or '').strip()
-                        if vid not in unresolved or not pid or pid == '0':
-                            continue
-                        bucket=history.setdefault(vid,{})
-                        if seen_date >= bucket.get(pid,''):
-                            bucket[pid]=seen_date
-                        chunk_seen.add(vid)
-                if progress:
-                    found_count=len((targets-unresolved) | chunk_seen)
-                    progress(f'노출ID 확인 {start:%Y-%m-%d}~{end:%Y-%m-%d} {page}페이지 / 발견 {found_count}/{len(targets)}')
-                has_next=bool(result.get('hasNext'))
-                next_token=str(result.get('nextToken') or '')
-                if not has_next:
-                    break
-                if not next_token or next_token in seen_tokens:
-                    raise CoupangAPIError('매출내역의 다음 페이지가 누락되거나 반복됩니다.')
-                seen_tokens.add(next_token)
-                token=next_token
-            self.check_cancelled()
-            self._query_cache.publish(completed_pages)
-            # We scan newest to oldest. Once an option appears in this entire
-            # date chunk, older chunks cannot provide a more current mapping.
-            unresolved -= chunk_seen
-            scanned_days += (end-start).days + 1
-            end=start-timedelta(days=1)
-
-        latest={}
-        for vid, by_pid in history.items():
-            if not by_pid:
-                continue
-            # Latest date wins. If multiple IDs share the same newest date, keep
-            # deterministic ordering while preserving every ID in history.
-            pid, seen=max(by_pid.items(), key=lambda kv:(kv[1], kv[0]))
-            latest[vid]={'productId':pid, 'seenDate':seen}
-        return {
-            'latest':latest,
-            'history':history,
-            'daysScanned':scanned_days,
-            'requests':request_count,
-            'cacheHits':cache_hits,
-            'unresolved':sorted(unresolved),
-        }
+        try:
+            return revenue_exposure.fetch(self, vendor_item_ids, lookback_days, progress)
+        except ValueError as exc:
+            raise CoupangAPIError(str(exc)) from exc
 
     def _debug_find_list_page(self, seller_product_id, business_types=None):
         """Find only the list page containing one sellerProductId and preserve the API response."""
@@ -849,6 +751,7 @@ class Database:
             key = ('v:' + oid) if oid else (('s:' + sid) if sid else ('r:' + str(r['id'])))
             h = self.conn.execute("""SELECT exposed_product_id FROM product_exposure_history
                                      WHERE option_key=? AND COALESCE(exposed_product_id,'')<>''
+                                       AND source NOT IN ('api-list','sibling','api-single')
                                      ORDER BY CASE
                                          WHEN source='manual' THEN 0
                                          WHEN source LIKE 'revenue%' THEN 1
@@ -859,40 +762,7 @@ class Database:
                 self.conn.execute("UPDATE products SET exposed_product_id=? WHERE id=? AND COALESCE(exposed_product_id,'')=''",
                                   (str(h['exposed_product_id']), r['id']))
 
-        # v0.2.10/11 may have written a seller-product-level list productId into
-        # every option. If that exact current value is recorded only as api-list
-        # and a trusted per-option value already exists in history, restore it on
-        # startup before the user even runs a new sync.
-        current_rows = self.conn.execute("""SELECT id,option_id,seller_product_item_id,item_id,exposed_product_id,link
-                                            FROM products WHERE COALESCE(exposed_product_id,'')<>''""").fetchall()
-        for r in current_rows:
-            oid=str(r['option_id'] or '').strip(); sid=str(r['seller_product_item_id'] or '').strip()
-            key=('v:'+oid) if oid else (('s:'+sid) if sid else ('r:'+str(r['id'])))
-            current_pid=str(r['exposed_product_id'] or '').strip()
-            curhist=self.conn.execute("""SELECT source FROM product_exposure_history
-                                         WHERE option_key=? AND exposed_product_id=? LIMIT 1""",
-                                      (key,current_pid)).fetchone()
-            if not curhist or str(curhist['source'] or '') != 'api-list':
-                continue
-            trusted=self.conn.execute("""SELECT exposed_product_id FROM product_exposure_history
-                                         WHERE option_key=? AND COALESCE(exposed_product_id,'')<>''
-                                           AND source<>'api-list'
-                                         ORDER BY CASE WHEN source='manual' THEN 0
-                                                       WHEN source LIKE 'revenue%' THEN 1
-                                                       WHEN source IN ('existing','sibling','excel-import','api-item','api-single') THEN 2
-                                                       ELSE 5 END,
-                                                  last_seen DESC,id DESC LIMIT 1""", (key,)).fetchone()
-            if not trusted or not trusted['exposed_product_id']:
-                continue
-            new_pid=str(trusted['exposed_product_id'])
-            old_link=str(r['link'] or '')
-            new_link=old_link
-            if not old_link or 'coupang.com/vp/products/' in old_link:
-                new_link=f'https://www.coupang.com/vp/products/{new_pid}'
-                if oid:
-                    new_link += '?' + urllib.parse.urlencode({'vendorItemId':oid})
-            self.conn.execute("UPDATE products SET exposed_product_id=?,link=? WHERE id=?",
-                              (new_pid,new_link,r['id']))
+        # Keep non-empty saved IDs and links; API enrichment fills verified gaps only.
         self.conn.commit()
 
     def close(self):
@@ -1998,6 +1868,7 @@ class CoupangManager(tk.Tk):
                     option=str(r['option_name'] or r['model'] or '옵션명 없음')
                     history=hist.get(self._exposure_option_key(r), [])
                     table_rows.append({'iid':str(r['id']), 'text':option, 'model':str(r['model'] or ''),
+                        'link_missing':not bool(self._resolved_product_link(r)),
                         'error':bool(str(r['sale_status_error'] or '').strip()), 'changed':len(history)>1,
                         'values':(fulfillment,status,money(r['sale_price']) if r['sale_price'] is not None else '—',
                                   money(r['map_price']) if r['map_price'] else '—',stock,'이력 확인')})
@@ -2061,7 +1932,7 @@ class CoupangManager(tk.Tk):
              "FROM product_exposure_history WHERE option_key=?")
         params=[key]
         if not include_untrusted:
-            sql += " AND source<>'api-list'"
+            sql += " AND source NOT IN ('api-list','sibling','api-single')"
         sql += " ORDER BY COALESCE(last_seen,'') DESC,id DESC"
         return self.db.query(sql,params)
 
@@ -2070,6 +1941,8 @@ class CoupangManager(tk.Tk):
             return ''
         # Current rule: always prefer a canonical URL generated from
         # exposed product ID + vendorItemId. Stored legacy links are only a fallback.
+        if str(row['link'] or '').strip():
+            return str(row['link']).strip()
         canonical=self._coupang_product_link(row['exposed_product_id'], '', row['option_id'])
         if canonical:
             return canonical
@@ -2208,6 +2081,7 @@ class CoupangManager(tk.Tk):
             else:
                 summary=f"{r['fulfillment_type'] or '판매자배송'}  ·  {r['model'] or '모델 미연결'}  ·  {r['option_name'] or '-'}"
                 if r['sale_status_checked_at']: summary += f"\n상태 확인 {r['sale_status_checked_at']}"
+                if not self._resolved_product_link(r): summary += '  ·  링크 확인 필요'
                 if str(r['sale_status_error'] or '').strip(): summary += '  ·  최근 조회 오류: 상세 보기에서 확인'
                 self.prod_detail_var.set(summary)
             return
@@ -2335,7 +2209,7 @@ class CoupangManager(tk.Tk):
         if link:
             webbrowser.open_new_tab(link)
         else:
-            messagebox.showinfo(APP_NAME,'선택한 행에 노출상품 ID/링크가 없습니다.')
+            messagebox.showinfo(APP_NAME,'링크 확인 필요: 이 옵션과 연결된 노출상품 ID를 아직 확인하지 못했습니다.')
 
     # ---------------- Search ----------------
     def build_search(self):
@@ -4259,7 +4133,7 @@ class CoupangManager(tk.Tk):
         key=self._make_exposure_key(option_id, seller_item_id, row_id)
         if not key:
             return False
-        existing=db.query("SELECT exposed_product_id FROM product_exposure_history WHERE option_key=? AND source<>'api-list' ORDER BY id", (key,))
+        existing=db.query("SELECT exposed_product_id FROM product_exposure_history WHERE option_key=? AND source NOT IN ('api-list','sibling','api-single') ORDER BY id", (key,))
         before={str(x['exposed_product_id'] or '') for x in existing if x['exposed_product_id']}
         db.conn.execute("""INSERT INTO product_exposure_history(
             option_key,option_id,seller_product_item_id,registered_product_id,exposed_product_id,model,option_name,source
@@ -4291,7 +4165,7 @@ class CoupangManager(tk.Tk):
         if not key:
             return '', ''
         row=db.one("""SELECT exposed_product_id,source,last_seen FROM product_exposure_history
-                      WHERE option_key=? AND COALESCE(exposed_product_id,'')<>'' AND source<>'api-list'
+                      WHERE option_key=? AND COALESCE(exposed_product_id,'')<>'' AND source NOT IN ('api-list','sibling','api-single')
                       ORDER BY CASE
                           WHEN source='manual' THEN 0
                           WHEN source LIKE 'revenue%' THEN 1
@@ -4317,6 +4191,11 @@ class CoupangManager(tk.Tk):
     def _merge_api_products(self, db, details):
         inserted = updated = 0
         fallback_option_ids=set()
+        all_evidence=[]
+        for detail in details:
+            all_evidence.extend([detail]+detail.get('_exposureListRows', []))
+        conflicts=set(exposure_lookup.extract(all_evidence, db.setting('api_vendor_id','').strip(),
+            rocket_only=False)['conflicts']) if all_evidence else set()
 
         def clean_existing_model(existing, product_name, display_name, general_name):
             """Keep real/manual models, but clear the old API bug that copied product names into model."""
@@ -4372,49 +4251,37 @@ class CoupangManager(tk.Tk):
             list_items=[x for x in (detail.get("_listItems") or []) if isinstance(x,dict)]
             if not list_items:
                 return detail_items or [None]
-            pools={}
-            for d in detail_items:
-                pools.setdefault(str(d.get("itemName") or ""), []).append(d)
-            merged=[]
-            used=set()
+            def identities(item):
+                sources=[item]+[item.get(k) or {} for k in ('marketPlaceItemData','marketplaceItemData','rocketGrowthItemData')]
+                return {str(x['vendorItemId']) for x in sources if isinstance(x,dict) and x.get('vendorItemId')}
+            merged=[]; used=set()
             for li in list_items:
-                name=str(li.get("itemName") or "")
-                candidates=pools.get(name) or []
-                di=None
-                for cand in candidates:
-                    marker=id(cand)
-                    if marker not in used:
-                        di=cand; used.add(marker); break
+                matches=[d for d in detail_items if identities(li) & identities(d)]
+                # Never join two options merely because they share a display name.
+                di=matches[0] if len(matches)==1 else None
                 row=dict(li)
-                if di:
-                    # Detail fields win because detail is the canonical product source.
+                if di is not None:
+                    used.add(id(di))
                     for k,v in di.items():
-                        if v not in (None,"",[],{}):
-                            row[k]=v
+                        if v not in (None,"",[],{}): row[k]=v
                 merged.append(row)
-            for d in detail_items:
-                if id(d) not in used:
-                    merged.append(d)
+            merged.extend(d for d in detail_items if id(d) not in used)
             return merged or [None]
 
         for detail in details:
             seller_id = str(detail.get("sellerProductId") or "")
-            # If a previous sync could only create a list-level placeholder,
-            # remove it once the full detail becomes available.
-            if seller_id:
-                db.conn.execute(
-                    "DELETE FROM products WHERE registered_product_id=? AND note LIKE '쿠팡 API 상세조회 실패%'",
-                    (seller_id,)
-                )
-            detail_product_id = str(detail.get("productId") or "")
             list_product_id = str(detail.get("_listProductId") or "")
             product_name = detail.get("sellerProductName") or ""
             display_name = detail.get("displayProductName") or ""
             category = str(detail.get("productGroup") or "").strip()
             api_status = detail.get("status") or detail.get("statusName") or ""
+            observed=[detail]+detail.get('_exposureListRows', [])
+            # Keep the unmerged channel rows so detail/list field precedence cannot hide IDs.
+            if detail.get('_listItems'):
+                observed.append(dict(sellerProductId=seller_id, vendorId=detail.get('vendorId'), items=detail['_listItems']))
+            verified=exposure_lookup.extract(observed, db.setting('api_vendor_id','').strip(),
+                seller_product_id=seller_id, rocket_only=False)
             items = merged_product_items(detail)
-            multi_option = len(items) > 1
-            single_top_product_id = (detail_product_id or list_product_id) if not multi_option else ''
 
             for item in items:
                 item = item or {}
@@ -4437,11 +4304,10 @@ class CoupangManager(tk.Tk):
                     # Only item/channel-level productId is unambiguous for an option.
                     # A seller-product/list-level productId cannot represent split/merged
                     # multi-option products, so only single-item products may use it.
-                    item_product_id = str(source.get("productId") or item.get("productId") or "").strip()
-                    product_id = item_product_id
-                    if not product_id and not single_top_product_id and vendor_item:
-                        # The primary product-detail API did not resolve an option-level
-                        # productId. Mark only this option for the supplemental fallback.
+                    product_id = str(verified['latest'].get(str(vendor_item or ''), {}).get('productId') or '')
+                    if str(vendor_item or '') in conflicts or str(vendor_item or '') in detail.get('_exposureConflicts', ()):
+                        product_id = ''
+                    if not product_id and vendor_item:
                         fallback_option_ids.add(str(vendor_item))
                     fulfillment_type = forced_fulfillment or "판매자배송"
                     existing = None
@@ -4451,21 +4317,10 @@ class CoupangManager(tk.Tk):
                             """SELECT * FROM products WHERE
                                COALESCE(NULLIF(fulfillment_type,''),'판매자배송')=? AND (
                                (?<>'' AND option_id=?) OR
-                               (?<>'' AND COALESCE(seller_product_item_id,'')=?))
+                               (?='' AND COALESCE(option_id,'')='' AND COALESCE(seller_product_item_id,'')=?))
                                ORDER BY id LIMIT 1""",
-                            (fulfillment_type, str(vendor_item or ''), str(vendor_item or ''), str(seller_item or ''), str(seller_item or ''))
+                            (fulfillment_type, str(vendor_item or ''), str(vendor_item or ''), str(vendor_item or ''), str(seller_item or ''))
                         )
-                    if not existing and seller_id and option_name:
-                        if fulfillment_type == "로켓그로스":
-                            existing = db.one("SELECT * FROM products WHERE registered_product_id=? AND option_name=? AND COALESCE(fulfillment_type,'')='로켓그로스' ORDER BY id LIMIT 1", (seller_id, option_name))
-                        else:
-                            existing = db.one("SELECT * FROM products WHERE registered_product_id=? AND option_name=? AND COALESCE(NULLIF(fulfillment_type,''),'판매자배송')='판매자배송' ORDER BY id LIMIT 1", (seller_id, option_name))
-                    if not existing and seller_id and len(items) == 1:
-                        if fulfillment_type == "로켓그로스":
-                            existing = db.one("SELECT * FROM products WHERE registered_product_id=? AND COALESCE(fulfillment_type,'')='로켓그로스' ORDER BY id LIMIT 1", (seller_id,))
-                        else:
-                            existing = db.one("SELECT * FROM products WHERE registered_product_id=? AND COALESCE(NULLIF(fulfillment_type,''),'판매자배송')='판매자배송' ORDER BY id LIMIT 1", (seller_id,))
-
                     link = self._coupang_product_link(product_id, item_id, vendor_item)
 
                     sibling = self._sibling_business_row(db, seller_id, option_name, fulfillment_type)
@@ -4474,11 +4329,6 @@ class CoupangManager(tk.Tk):
                     sibling_gift = sibling['gift'] if sibling else None
                     sibling_coupon = sibling['coupon_price'] if sibling else None
                     sibling_map = sibling['map_price'] if sibling else None
-                    sibling_pid = ''
-                    if sibling:
-                        sibling_pid, _ = self._best_trusted_exposure(
-                            db, sibling['option_id'], sibling['seller_product_item_id'], sibling['id'])
-
                     if existing:
                         # Model column must contain a real model number / vendor SKU only.
                         # Never fall back to sellerProductName/generalProductName.
@@ -4489,20 +4339,11 @@ class CoupangManager(tk.Tk):
                         existing_pid = str(existing['exposed_product_id'] or '').strip()
                         trusted_pid, trusted_source = self._best_trusted_exposure(
                             db, existing['option_id'], existing['seller_product_item_id'], existing['id'])
-                        # Multi-option list/top-level productId is ambiguous. Prefer an
-                        # item-level API value, trusted history/manual value, or the
-                        # counterpart channel's trusted value.
-                        final_product_id = product_id or trusted_pid or sibling_pid or single_top_product_id
-                        exposure_source = ('api-item' if product_id else
-                                           (trusted_source if trusted_pid else
-                                            ('sibling' if sibling_pid else
-                                             ('api-single' if single_top_product_id else ''))))
+                        # Existing values win; only explicit same-option evidence fills gaps.
+                        final_product_id = existing_pid or trusted_pid or product_id
+                        exposure_source = (trusted_source if trusted_pid else 'api-item') if final_product_id and not existing_pid else ''
                         link = self._coupang_product_link(final_product_id, item_id, vendor_item)
-                        existing_link = str(existing['link'] or '').strip()
-                        if link and (not existing_link or 'coupang.com/vp/products/' in existing_link):
-                            final_link = link
-                        else:
-                            final_link = existing_link or link
+                        final_link = str(existing['link'] or '').strip() or link
                         final_gift = existing['gift'] if existing['gift'] not in (None, '') else sibling_gift
                         final_coupon = existing['coupon_price'] if existing['coupon_price'] is not None else sibling_coupon
                         final_map = existing['map_price'] if existing['map_price'] not in (None, 0) else sibling_map
@@ -4525,10 +4366,8 @@ class CoupangManager(tk.Tk):
                         # Inherit our internal management fields from the marketplace/manual sibling.
                         final_model = model or sibling_model
                         final_category = sibling_category or self._usable_internal_category(category)
-                        final_product_id = product_id or sibling_pid or single_top_product_id
-                        exposure_source = ('api-item' if product_id else
-                                           ('sibling' if sibling_pid else
-                                            ('api-single' if single_top_product_id else '')))
+                        final_product_id = product_id
+                        exposure_source = 'api-item' if product_id else ''
                         link = self._coupang_product_link(final_product_id, item_id, vendor_item)
                         final_gift = sibling_gift
                         final_coupon = sibling_coupon
@@ -4551,22 +4390,26 @@ class CoupangManager(tk.Tk):
                         db.conn.execute('UPDATE products SET image_url=? WHERE id=?',
                                         (image_url, existing['id'] if existing else cur.lastrowid))
         db.conn.commit()
-        cleaned = self._cleanup_legacy_api_duplicates(db)
-        if cleaned:
-            LOGGER.info('구버전 API 중복행 총 %s건 정리', cleaned)
+        # Do not delete another option merely because its seller-item ID/name matches.
         return inserted, updated, sorted(fallback_option_ids)
 
-    def _apply_revenue_exposure_map(self, db, exposure_result):
+    def _apply_revenue_exposure_map(self, db, exposure_result, source_prefix="revenue"):
         """Apply option-level productIds learned from revenue history.
 
-        Every observed mapping is retained in product_exposure_history. The most
-        recent mapping becomes the currently displayed exposed product ID.
+        Fill only blank IDs from unambiguous evidence; preserve stored IDs and links.
         """
         latest=(exposure_result or {}).get('latest') or {}
         history=(exposure_result or {}).get('history') or {}
         changed=0; touched=0
         for vid, by_pid in history.items():
+            current=(latest.get(str(vid)) or {})
+            new_pid=str(current.get('productId') or '').strip()
+            if (str(vid) in exposure_result.get('ambiguous', []) or not new_pid
+                    or new_pid not in by_pid):
+                continue
             rows=db.query('SELECT * FROM products WHERE option_id=? ORDER BY id', (str(vid),))
+            if current.get('sellerProductId'):
+                rows=[row for row in rows if str(row['registered_product_id'])==str(current['sellerProductId'])]
             if not rows:
                 continue
             for pid, seen_date in (by_pid or {}).items():
@@ -4576,26 +4419,19 @@ class CoupangManager(tk.Tk):
                     self._record_exposure(
                         db, row['option_id'], row['seller_product_item_id'],
                         row['registered_product_id'], str(pid), row['model'], row['option_name'],
-                        'revenue:' + str(seen_date or ''), row['id'])
+                        source_prefix + ':' + str(seen_date or ''), row['id'])
             current=(latest.get(str(vid)) or {})
             new_pid=str(current.get('productId') or '').strip()
             seen_date=str(current.get('seenDate') or '')
-            if not new_pid:
+            if not new_pid or new_pid not in by_pid:
                 continue
             for row in rows:
-                # An explicit manual correction remains authoritative until the
-                # user changes it; otherwise newest revenue mapping wins.
-                manual=db.one("""SELECT exposed_product_id FROM product_exposure_history
-                                 WHERE option_key=? AND source='manual'
-                                 ORDER BY last_seen DESC,id DESC LIMIT 1""",
-                              (self._make_exposure_key(row['option_id'], row['seller_product_item_id'], row['id']),))
-                if manual and str(manual['exposed_product_id'] or '').strip() and str(row['exposed_product_id'] or '').strip()==str(manual['exposed_product_id'] or '').strip():
-                    continue
                 old_pid=str(row['exposed_product_id'] or '').strip()
-                item_id=str(row['item_id'] or '').strip() if 'item_id' in row.keys() else ''
-                new_link=self._coupang_product_link(new_pid, item_id, row['option_id'])
                 old_link=str(row['link'] or '').strip()
-                final_link=new_link if new_link and (not old_link or 'coupang.com/vp/products/' in old_link) else old_link
+                if old_pid:
+                    continue
+                new_link=self._coupang_product_link(new_pid, '', row['option_id'])
+                final_link=old_link or new_link
                 db.conn.execute('UPDATE products SET exposed_product_id=?,link=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',
                                 (new_pid, final_link, row['id']))
                 touched += 1
@@ -4616,7 +4452,6 @@ class CoupangManager(tk.Tk):
             sid = str(p.get('sellerProductId') or '')
             if not sid: continue
             name = p.get('sellerProductName') or p.get('displayProductName') or ''
-            product_id = str(p.get('productId') or '')
             category = ''
             api_status = p.get('statusName') or p.get('status') or ''  # 등록/승인상태일 뿐 판매상태가 아님
             source_list=list(p.get('_sources') or []); sources=','.join(source_list)
@@ -4645,7 +4480,7 @@ class CoupangManager(tk.Tk):
                        category,fulfillment_type,status,model,product_name,display_name,registered_product_id,
                        exposed_product_id,option_name,option_id,link,note
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (category, fulfillment, ('로켓그로스' if fulfillment=='로켓그로스' else '판매중'), model, name, '', sid, product_id, '[상세조회 실패]', '', '', note)
+                    (category, fulfillment, ('로켓그로스' if fulfillment=='로켓그로스' else '판매중'), model, name, '', sid, '', '[상세조회 실패]', '', '', note)
                 )
                 inserted += 1
                 LOGGER.warning('상세조회 실패 상품 placeholder 생성 sellerProductId=%s name=%s registrationStatus=%s sources=%s error=%s',sid, name, api_status, sources, entry.get('error',''))
@@ -4752,10 +4587,12 @@ class CoupangManager(tk.Tk):
                 if sid not in by_id:
                     by_id[sid]=dict(p)
                     by_id[sid]['_sources']=[source_name]
+                    by_id[sid]['_exposureListRows']=[dict(p)]
                     first_pid=str(p.get('productId') or '').strip()
                     by_id[sid]['_listProductIds']=[first_pid] if first_pid else []
                 else:
                     cur=by_id[sid]
+                    cur['_exposureListRows'].append(dict(p))
                     srcs=cur.setdefault('_sources',[])
                     pid=str(p.get('productId') or '').strip()
                     pids=cur.setdefault('_listProductIds',[])
@@ -4783,6 +4620,7 @@ class CoupangManager(tk.Tk):
                 detail['_listProductId'] = list_pids[0] if list_pids else str(p.get('productId') or '')
                 detail['_listProductIds'] = list_pids
                 detail['_listItems'] = p.get('items') or []
+                detail['_exposureListRows'] = p.get('_exposureListRows') or []
                 details.append(detail)
             except Exception as e:
                 if getattr(e, 'stop_sync', False):
@@ -4805,6 +4643,9 @@ class CoupangManager(tk.Tk):
         # Retry limits and backoff live in the common request layer. A failed
         # detail keeps the existing product through the list fallback below.
         api.check_cancelled()
+        list_result=exposure_lookup.extract(marketplace+rocket+details, api.vendor_id, rocket_only=False)
+        for detail in details:
+            detail['_exposureConflicts']=set(list_result['conflicts'])
         ins,upd,fallback_option_ids=self._merge_api_products(db2,details)
         fb_ins,fb_upd=self._merge_failed_list_products(db2,failed_products)
         ins += fb_ins
@@ -4815,13 +4656,18 @@ class CoupangManager(tk.Tk):
         except Exception:
             LOGGER.exception('상품 동기화 후 모델 자동연결 실패')
 
-        # 상품조회 API가 메인 데이터 소스다. 상품조회가 옵션/channel 레벨
-        # productId를 직접 주지 못한 옵션만 fallback 검증 대상으로 보낸다.
-        # 기존 엑셀 ID가 있더라도 최근 매출에서 더 최신 productId가 확인되면
-        # 머지/분리 변경을 반영할 수 있다.
+        # Only unresolved blank IDs need revenue enrichment; saved IDs remain authoritative.
         exposure_touched=0; exposure_changed=0; warnings=[]
+        if list_result['latest']:
+            list_result['history']={vid:{v['productId']:datetime.now().strftime('%Y-%m-%d')}
+                                    for vid,v in list_result['latest'].items()}
+            exposure_touched,exposure_changed=self._apply_revenue_exposure_map(db2,list_result,source_prefix='rg-list')
         try:
-            fallback_ids=[str(x) for x in fallback_option_ids if str(x).strip()]
+            fallback_ids=[str(x) for x in fallback_option_ids if str(x).strip() and str(x) not in list_result['conflicts']]
+            if fallback_ids:
+                missing={str(r['option_id']) for r in db2.query(
+                    "SELECT option_id FROM products WHERE COALESCE(TRIM(exposed_product_id),'')='' AND COALESCE(option_id,'')<>''")}
+                fallback_ids=[oid for oid in fallback_ids if oid in missing]
             if db2.setting('display_multitap_only','1') == '1' and fallback_ids:
                 clause=self._multitap_product_clause('p')
                 allowed={str(r['option_id']) for r in db2.query(
@@ -4839,7 +4685,7 @@ class CoupangManager(tk.Tk):
                 # 최근 매출에도 없고 현재 노출ID까지 비어 있는 옵션만 최초 1회
                 # 186일까지 확장한다. 기존 값이 있는 옵션 때문에 긴 과거 조회를
                 # 매번 돌지는 않는다.
-                if db2.setting('exposure_fallback_bootstrap_v0213_done','0') != '1':
+                if db2.setting('exposure_fallback_bootstrap_v0426_done','0') != '1':
                     unresolved_recent={str(x) for x in (recent.get('unresolved') or []) if str(x).strip()}
                     remaining=[]
                     for oid in fallback_ids:
@@ -4855,8 +4701,8 @@ class CoupangManager(tk.Tk):
                             progress=lambda msg:self.api_queue.put(('status','fallback · '+msg)))
                         t,c=self._apply_revenue_exposure_map(db2,historic)
                         exposure_touched += t; exposure_changed += c
-                    db2.set_setting('exposure_fallback_bootstrap_v0213_done','1')
-                    db2.set_setting('exposure_fallback_bootstrap_v0213_at',datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                    db2.set_setting('exposure_fallback_bootstrap_v0426_done','1')
+                    db2.set_setting('exposure_fallback_bootstrap_v0426_at',datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
                 LOGGER.info('상품조회 미제공 옵션 fallback 완료 candidates=%s touched=%s changed=%s', len(fallback_ids), exposure_touched, exposure_changed)
             else:
                 LOGGER.info('상품조회 API가 옵션별 노출상품 ID를 직접 제공했거나 fallback 대상 없음')

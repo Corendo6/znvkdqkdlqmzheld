@@ -18,13 +18,14 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import api_query
+import revenue_exposure
 
 
 source = Path(__file__).resolve().parents[1] / 'coupang_manager.pyw'
 classes = [node for node in ast.parse(source.read_text(encoding='utf-8-sig')).body
            if isinstance(node, ast.ClassDef)
            and node.name in ('CoupangAPI', 'CoupangAPIError', 'CoupangAPICancelled')]
-namespace = dict(api_query=api_query, threading=threading, time=time, urllib=urllib,
+namespace = dict(api_query=api_query, revenue_exposure=revenue_exposure, threading=threading, time=time, urllib=urllib,
                  json=json, datetime=datetime, date=date, timedelta=timedelta,
                  hmac=hmac, hashlib=hashlib, LOGGER=Mock())
 exec(compile(ast.Module(body=classes, type_ignores=[]), str(source), 'exec'), namespace)
@@ -150,10 +151,11 @@ class RevenueCacheTests(unittest.TestCase):
     def setUp(self):
         self.api = CoupangAPI('A1', 'not-a-key', 'not-a-secret')
         self.api._request = Mock()
+        self.api._query_cache.day = date(2026, 11, 17)
 
-    def page(self, *pairs, token=None):
-        return dict(code='SUCCESS', data=[dict(saleDate='2026-11-01',
-            items=[dict(vendorItemId=oid, productId=pid) for oid, pid in pairs])],
+    def page(self, *pairs, token=None, sale_date='2026-11-01'):
+        return dict(code='SUCCESS', data=[dict(saleDate=sale_date,
+            items=[dict(vendorItemId=oid, productId=pid) for oid, pid in pairs])] if pairs else [],
             hasNext=token is not None, nextToken=token)
 
     def test_later_target_uses_raw_page_before_original_target_filter(self):
@@ -167,13 +169,14 @@ class RevenueCacheTests(unittest.TestCase):
         self.assertEqual(second['cacheHits'], 1)
 
     def test_extended_history_fetches_older_chunk_only(self):
-        self.api._request.side_effect = [self.page(), self.page(('200', '2000'))]
+        self.api._request.side_effect = [self.page() for _ in range(5)] + [self.page(('200', '2000'), sale_date='2026-10-18')]
         self.api.get_revenue_exposure_map(['200'], lookback_days=31)
         result = self.api.get_revenue_exposure_map(['200'], lookback_days=186)
         self.assertEqual(result['latest']['200']['productId'], '2000')
-        self.assertEqual(self.api._request.call_count, 2)
+        self.assertEqual(self.api._request.call_count, 6)
+        self.assertEqual(result['cacheHits'], 4)
         first_params = dict(self.api._request.call_args_list[0].args[2])
-        second_params = dict(self.api._request.call_args_list[1].args[2])
+        second_params = dict(self.api._request.call_args_list[-1].args[2])
         self.assertLess(second_params['recognitionDateTo'], first_params['recognitionDateFrom'])
 
     def test_failed_incomplete_chunk_is_not_published(self):
@@ -223,7 +226,8 @@ class RevenueCacheTests(unittest.TestCase):
         self.api.vendor_id = 'A2'
         self.api.get_revenue_exposure_map(['100'], lookback_days=31)
         self.api.get_revenue_exposure_map(['100'], lookback_days=30)
-        self.assertEqual(self.api._request.call_count, 3)
+        # Different total lookbacks share the same complete newest 7-day window.
+        self.assertEqual(self.api._request.call_count, 2)
         fresh = CoupangAPI('A2', 'not-a-key', 'not-a-secret')
         self.assertEqual(fresh._query_cache._pages, {})
 

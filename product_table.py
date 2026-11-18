@@ -38,7 +38,7 @@ class ProductTable(tk.Canvas):
         self.small = tkfont.Font(self, family=family, size=9)
         self.row_height = max(58, self.regular.metrics('linespace') + self.small.metrics('linespace') + 17)
         self.group_height = self.row_height
-        self.widths = [290, 112, 102, 108, 103, 90, 100]
+        self.widths = [290, 112, 102, 108, 103, 90, 120]
         for n, heading in enumerate(self.HEADINGS):
             self.widths[n] = max(self.widths[n], self.small.measure(heading) + 30)
         self._width = sum(self.widths)
@@ -330,8 +330,10 @@ class ProductTable(tk.Canvas):
             self._text(bx+7, by, label, self.small, fg)
             if node['error']:
                 self._text(bx, y+height-10, '조회 오류', self.small, '#895710')
-            self._text(edges[6]+13, y+height/2-(8 if node['changed'] else 0), '이력 확인', self.small, self.BLUE)
-            if node['changed']:
+            self._text(edges[6]+13, y+height/2-(8 if node['changed'] or node.get('link_missing') else 0), '이력 확인', self.small, self.BLUE)
+            if node.get('link_missing'):
+                self._text(edges[6]+8, y+height-12, '링크 확인 필요', self.small, '#895710')
+            elif node['changed']:
                 self._text(edges[6]+13, y+height-12, '이력 변경', self.small, '#895710')
             for col in (3, 6):
                 self.create_line(edges[col], y, edges[col], y+height, fill=self.LINE)

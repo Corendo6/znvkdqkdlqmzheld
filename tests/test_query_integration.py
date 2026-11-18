@@ -182,7 +182,8 @@ class ProductDetailBoundaryTests(unittest.TestCase):
         tree = ast.parse(source.read_text(encoding='utf-8-sig'))
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'CoupangManager')
         method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_sync_product_data')
-        namespace = dict(LOGGER=Mock(), datetime=datetime)
+        import exposure_lookup
+        namespace = dict(LOGGER=Mock(), datetime=datetime, exposure_lookup=exposure_lookup)
         exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), namespace)
         self.db = SimpleNamespace(setting=lambda key, default='': default, set_setting=Mock())
         self.app = SimpleNamespace(api_queue=queue.Queue(),
@@ -193,9 +194,9 @@ class ProductDetailBoundaryTests(unittest.TestCase):
         self.app._sync_product_data = MethodType(namespace['_sync_product_data'], self.app)
         self.api = SimpleNamespace(vendor_id=VENDOR, wait=Mock(), check_cancelled=Mock(),
             get_all_products=Mock(side_effect=[
-                [dict(sellerProductId='501', productId='601', items=[{'vendorItemId': '101'}])],
-                [dict(sellerProductId='501', productId='602')]]),
-            get_product=Mock(return_value={'sellerProductId': '501'}))
+                [dict(vendorId=VENDOR, sellerProductId='501', productId='601', items=[{'vendorItemId': '101'}])],
+                [dict(vendorId=VENDOR, sellerProductId='501', productId='602')]]),
+            get_product=Mock(return_value={'vendorId': VENDOR, 'sellerProductId': '501'}))
 
     def test_list_overlap_queries_one_detail_and_preserves_both_exposure_ids(self):
         result = self.app._sync_product_data(self.api, self.db)
