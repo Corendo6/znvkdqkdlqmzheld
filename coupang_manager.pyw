@@ -37,7 +37,7 @@ import product_search
 from product_table import ProductTable
 
 APP_NAME = "쿠팡 관리 프로그램"
-VERSION = "0.4.26"
+VERSION = "0.5.0"
 
 
 def resource_path(*parts):
@@ -3214,6 +3214,7 @@ class CoupangManager(tk.Tk):
         self.sales_api_sync_button.pack(side='left')
         self.sales_api_full_button=ttk.Button(sync_bar,text='30일 전체 재조회',command=lambda:self.sync_recent_daily_sales(force=True))
         self.sales_api_full_button.pack(side='left',padx=6)
+        ttk.Button(sync_bar,text='일일 비교',style='Accent.TButton',command=self.show_daily_comparison).pack(side='right')
         ttk.Button(sync_bar,text='수집 상태',command=self.show_sales_collection_status).pack(side='left')
         self.sales_api_cancel_button=ttk.Button(sync_bar,text='조회 취소',command=self.api_cancel_sync)
         self.sales_api_cancel_button.pack(side='left',padx=6)
@@ -3243,6 +3244,10 @@ class CoupangManager(tk.Tk):
         self.sales_tree=self.make_tree(self.content,cols,{'id':55,'date':105,'model':120,'oid':125,'option':230,'method':105,'revenue':120,'orders':65,'qty':65,'source':180})
         self.refresh_sales()
         self._update_api_controls()
+
+    def show_daily_comparison(self):
+        from daily_comparison_view import ComparisonWindow
+        return ComparisonWindow(self)
 
     def sync_recent_daily_sales(self, force=False):
         today=rocket_sales.today_kst()
